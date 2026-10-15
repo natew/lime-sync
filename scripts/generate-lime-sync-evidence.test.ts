@@ -104,6 +104,23 @@ describe('exact-SHA release evidence identity', () => {
     expect(statusForQualifiedBuild(null)).toBe('unverified')
   })
 
+  it('accepts a verified build before any stable release tag exists', () => {
+    const evidence = fixture('verified', mainBuildSha)
+    evidence.release = { version: null, tag: null, sha: null, url: null }
+    expect(
+      classifyEvidenceIdentity(evidence.status, evidence.release.sha, mainBuildSha)
+    ).toBe('verified-build')
+    expect(() => validate(evidence, mainBuildSha)).not.toThrow()
+  })
+
+  it('requires a tagged release to name an immutable SHA', () => {
+    const evidence = fixture('verified', mainBuildSha)
+    evidence.release = { version: '0.16.20', tag: 'v0.16.20', sha: null, url: null }
+    expect(() => validate(evidence, mainBuildSha)).toThrow(
+      'release.sha must be a full immutable commit SHA'
+    )
+  })
+
   it('records the newest published stable tag when the manifest is ahead of the tags', () => {
     const tags = [
       'v0.16.11',

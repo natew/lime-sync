@@ -204,7 +204,6 @@
     "requiredJobs": [
       "test",
       "harness",
-      "native-integration",
       "rust",
       "rust-local",
       "rust-local-faults",

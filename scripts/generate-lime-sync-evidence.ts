@@ -24,7 +24,12 @@ type Suite = {
 export type Evidence = {
   schemaVersion: number
   status: Status
-  release: { version: string; tag: string; sha: string | null; url: string }
+  release: {
+    version: string | null
+    tag: string | null
+    sha: string | null
+    url: string | null
+  }
   build: { sha: string | null; url: string | null }
   versions: Record<string, string | null>
   qualification: {
@@ -49,7 +54,7 @@ export type Evidence = {
   }
   reproduction: { environment: string[]; full: string[] }
   knownLimitations: string[]
-  unresolvedLanes: { name: string; status: string; detail: string; url: string }[]
+  unresolvedLanes: { name: string; status: string; detail: string; url: string | null }[]
   gate: { workflow: string; branch: string; requiredJobs: string[]; policy: string }
 }
 
@@ -278,10 +283,11 @@ export function latestReleasedTag(tags: string[], packageVersion: string): strin
   return best?.tag ?? null
 }
 
+// null until the first stable release tag exists; the ledger then records no release.
 async function resolveReleaseTag(
   packageTag: string,
   packageVersion: string
-): Promise<string> {
+): Promise<string | null> {
   try {
     await githubJson(`/repos/${githubRepository}/git/ref/tags/${packageTag}`)
     return packageTag
@@ -296,7 +302,8 @@ async function resolveReleaseTag(
     packageVersion
   )
   if (!fallback) {
-    throw new Error(`no stable release tag exists at or below ${packageTag}`)
+    console.warn(`no stable release tag exists at or below ${packageTag}; recording none`)
+    return null
   }
   console.warn(`release tag ${packageTag} is not published yet; recording ${fallback}`)
   return fallback
@@ -323,11 +330,13 @@ export function statusForQualifiedBuild(buildSha: string | null): Status {
 export function validate(evidence: Evidence, expectedSha?: string): void {
   const errors: string[] = []
   if (evidence.schemaVersion !== 1) errors.push('schemaVersion must be 1')
-  if (!/^\d+\.\d+\.\d+$/.test(evidence.release.version)) {
-    errors.push('release.version must be exact semver')
-  }
-  if (!evidence.release.sha || !/^[0-9a-f]{40}$/.test(evidence.release.sha)) {
-    errors.push('release.sha must be a full immutable commit SHA')
+  if (evidence.release.tag !== null) {
+    if (!/^\d+\.\d+\.\d+$/.test(evidence.release.version ?? '')) {
+      errors.push('release.version must be exact semver')
+    }
+    if (!evidence.release.sha || !/^[0-9a-f]{40}$/.test(evidence.release.sha)) {
+      errors.push('release.sha must be a full immutable commit SHA')
+    }
   }
   for (const key of ['zero', 'rust', 'sqlite', 'rusqlite', 'libsqlite3Sys', 'workerd']) {
     if (!evidence.versions[key]) errors.push(`versions.${key} is required`)
@@ -416,7 +425,7 @@ async function generate(): Promise<void> {
   }
   const releaseTag =
     pushedTag ?? (await resolveReleaseTag(packageTag, litePackage.version))
-  const releaseVersion = releaseTag.startsWith('v') ? releaseTag.slice(1) : releaseTag
+  const releaseVersion = releaseTag?.startsWith('v') ? releaseTag.slice(1) : releaseTag
   const [run, jobsResponse] = await Promise.all([
     githubJson<ActionsRun>(`/repos/${githubRepository}/actions/runs/${runId}`),
     githubJson<{ jobs: ActionsJob[] }>(
@@ -425,10 +434,10 @@ async function generate(): Promise<void> {
   ])
 
   const isMainBuild = run.head_branch === evidence.gate.branch
-  const isReleaseTagBuild = process.env.GITHUB_REF === `refs/tags/${releaseTag}`
+  const isReleaseTagBuild = pushedTag !== null
   if (run.event !== 'push' || (!isMainBuild && !isReleaseTagBuild)) {
     throw new Error(
-      `only a push to ${evidence.gate.branch} or ${releaseTag} can publish build evidence`
+      `only a push to ${evidence.gate.branch} or a release tag can publish build evidence`
     )
   }
   if (run.head_sha !== sha) {
@@ -468,8 +477,9 @@ async function generate(): Promise<void> {
 
   evidence.release.version = releaseVersion
   evidence.release.tag = releaseTag
-  evidence.release.sha = await releaseSha(evidence.release.tag)
-  evidence.release.url = `${repositoryUrl}/tree/${evidence.release.tag}`
+  evidence.release.sha = releaseTag === null ? null : await releaseSha(releaseTag)
+  evidence.release.url =
+    releaseTag === null ? null : `${repositoryUrl}/tree/${releaseTag}`
   evidence.build = { sha, url: `${repositoryUrl}/tree/${sha}` }
   evidence.status = statusForQualifiedBuild(sha)
   if (isReleaseTagBuild && evidence.release.sha !== sha) {
@@ -621,7 +631,9 @@ async function generate(): Promise<void> {
   const releaseIdentityLimitation = isVerifiedRelease
     ? []
     : [
-        `Build ${sha} passed the required CI jobs and is verified at that exact SHA. It is newer than release ${releaseTag}, which resolves to ${evidence.release.sha}, so it is not labeled as a verified release.`,
+        releaseTag === null
+          ? `Build ${sha} passed the required CI jobs and is verified at that exact SHA. No stable release tag exists yet, so it is not labeled as a verified release.`
+          : `Build ${sha} passed the required CI jobs and is verified at that exact SHA. It is newer than release ${releaseTag}, which resolves to ${evidence.release.sha}, so it is not labeled as a verified release.`,
       ]
   evidence.knownLimitations = [
     ...releaseIdentityLimitation,
@@ -637,8 +649,14 @@ async function generate(): Promise<void> {
           {
             name: 'Release identity',
             status: 'awaiting',
-            detail: `The build is CI-verified, but ${releaseTag} names ${evidence.release.sha} rather than ${sha}.`,
-            url: `${repositoryUrl}/compare/${evidence.release.tag}...${sha}`,
+            detail:
+              releaseTag === null
+                ? 'The build is CI-verified, but no stable release tag exists yet.'
+                : `The build is CI-verified, but ${releaseTag} names ${evidence.release.sha} rather than ${sha}.`,
+            url:
+              releaseTag === null
+                ? null
+                : `${repositoryUrl}/compare/${releaseTag}...${sha}`,
           },
         ]),
     {
