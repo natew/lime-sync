@@ -1,0 +1,680 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: mutant patch applicability
+        run: |
+          for patch in harness/mutants/patches/*.patch; do
+            target=$(sed -n 's|^+++ b/||p' "$patch")
+            if ! git apply --check "$patch"; then
+              echo "stale mutant patch: $patch targets $target" >&2
+              exit 1
+            fi
+          done
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-unknown-unknown
+
+      - uses: ./.github/actions/setup-wasm-pack
+
+      - run: bun install --frozen-lockfile
+
+      - name: build
+        run: bun run build
+
+      - name: lint
+        run: bun run lint
+
+      - name: format check
+        run: bun run format:check
+
+      - name: npm release availability checks
+        run: bun test scripts/release-publish.test.ts scripts/verify-npm-release.test.ts
+
+      - name: typecheck
+        run: bun run check
+
+      - name: test
+        run: bun run test
+
+      - name: TypeScript host mutation matrix
+        id: host-mutation-matrix
+        run: >-
+          cd harness && bun scripts/mutation-matrix.ts
+          --mutants H1-backup-scan-without-read-session,H2-admit-writer-with-reader-open,H3-skip-pending-change-promotion
+          --lanes lime-sync-host
+          --gate
+          --run-id host-${{ github.run_id }}
+
+      - name: upload TypeScript host mutation results
+        if: ${{ always() && steps.host-mutation-matrix.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-mutation-matrix-${{ github.sha }}
+          path: harness/results/mutation-matrix/host-${{ github.run_id }}/
+          if-no-files-found: error
+
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # the harness imports repository source and built workspace packages.
+      - run: bun install --frozen-lockfile
+
+      - name: build sync runtime
+        run: bun run build:sync-runtime
+
+      - name: harness install
+        run: cd harness && bun install
+
+      - name: consistency checker self-tests
+        run: |
+          cd harness
+          bun test src/consistency/history.test.ts src/consistency/fault-schedule.test.ts src/consistency/recorder.test.ts src/consistency/artifacts.test.ts src/consistency/atomic-visibility.test.ts src/consistency/atomic-visibility-workload.test.ts src/consistency/exactly-once-lmid.test.ts src/consistency/exactly-once-workload.test.ts src/observed-fetch.test.ts src/consistency/permission-transition.test.ts src/consistency/permission-transition-workload.test.ts src/consistency/permission-artifacts.test.ts
+
+      - name: metamorphic checker self-test
+        run: cd harness && bun src/metamorphic.selftest.ts
+
+      - name: shrink and corpus self-test
+        run: cd harness && bun src/spec-shrink.selftest.ts
+
+  sync-browser-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-unknown-unknown
+
+      - uses: ./.github/actions/setup-wasm-pack
+
+      - run: bun install --frozen-lockfile
+
+      - name: build sync runtime dependencies
+        run: |
+          bun run build:sync-runtime
+          bun run --cwd packages/lime-sync-cf-host build:dist
+
+      - name: install chromium
+        run: bun run --cwd packages/lime-sync-browser-host playwright install --with-deps chromium
+
+      - name: browser worker durability and protocol suite
+        run: bun run test:sync-browser-host
+
+  # rust sync engine: workspace build + native crate tests + format gate.
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # the sync-core differential test shells out to bun to run the
+      # ts-oracle (crates/sync-core/ts-oracle/run-oracle.ts) against the
+      # workspace executor package.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: build sync runtime
+        run: bun run build:sync-runtime
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: ./.github/actions/setup-wasm-pack
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - name: install pinned Rust license generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: check sync-native license bundle
+        run: |
+          cargo about generate \
+            --locked \
+            --manifest-path crates/sync-native/Cargo.toml \
+            --fail \
+            --output-file /tmp/sync-native-LICENSES.txt \
+            scripts/sync-native-licenses.hbs
+          bun scripts/normalize-sync-native-licenses.ts \
+            /tmp/sync-native-LICENSES.txt
+          cmp LICENSES.txt /tmp/sync-native-LICENSES.txt
+
+      # the whole workspace must compile (the native host depends on sync-core
+      # and sync-wasm building); per-crate fmt gates stay owned by each track.
+      - name: build workspace
+        run: cargo build --workspace
+
+      - name: native launcher supervision
+        run: node --test packages/lime-sync-native/supervision.test.cjs
+
+      - name: sync-native format check
+        run: cargo fmt -p sync-native -- --check
+
+      - name: workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # run every crate's test suite, not just sync-native: sync-core carries
+      # the query-compiler + permission regression tests behind the review
+      # fixes, and they must be enforced here rather than left unrun.
+      - name: workspace tests
+        run: cargo test --workspace
+
+      - name: sync-wasm node tests
+        run: wasm-pack test --node crates/sync-wasm
+
+  sync-native-package-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.plan.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Plan native package builds
+        id: plan
+        run: |
+          echo "version=$(bun scripts/sync-native-package.ts version)" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(bun scripts/sync-native-package.ts matrix)" >> "$GITHUB_OUTPUT"
+
+  # build the same package artifacts the release workflow will publish, on
+  # every supported hosted runner, without registry credentials or writes.
+  sync-native-packages:
+    needs: sync-native-package-plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.sync-native-package-plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-sync-native
+        with:
+          id: ${{ matrix.id }}
+          target: ${{ matrix.target }}
+          executable: ${{ matrix.executable }}
+          version: ${{ needs.sync-native-package-plan.outputs.version }}
+          libc: ${{ matrix.libc }}
+
+  # Checker-boundary self-tests only. These prove the pinned Elle binary accepts
+  # and rejects known JSON histories; they do not check an Orez workload.
+  elle-cli-self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: cache pinned Elle release
+        uses: actions/cache@v4
+        with:
+          path: .cache/elle-cli
+          key: elle-cli-${{ runner.os }}-${{ hashFiles('scripts/elle/lib.sh', 'scripts/elle/self-test.sh') }}
+          restore-keys: |
+            elle-cli-${{ runner.os }}-
+
+      - name: official Elle CLI checker self-tests
+        env:
+          ELLE_CACHE_DIR: ${{ github.workspace }}/.cache/elle-cli
+          ELLE_RESULTS_DIR: ${{ github.workspace }}/target/elle-self-test
+        run: scripts/elle/self-test.sh
+
+      - name: upload Elle checker self-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elle-cli-self-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/elle-self-test/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # native real-client conformance: build the sync-native release binary and run
+  # the rust-local harness lanes against it. shapes/sweep boot embedded postgres +
+  # real zero-cache (Node), the same differential the rust-local job runs.
+  rust-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # no explicit node setup: the runner's default node is what the existing
+      # `harness` job boots stock-zero under, and zero-sqlite3's native binding
+      # is built for that ABI. pinning a different node risks a prebuild ABI
+      # mismatch (NODE_MODULE_VERSION), so mirror the harness job's environment.
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - name: build sync-native fixture (release)
+        run: cargo build --release -p sync-native --bin sync-native-fixture
+
+      # the harness imports repository source and built workspace packages.
+      - run: bun install --frozen-lockfile
+
+      - name: build sync runtime
+        run: bun run build:sync-runtime
+
+      - name: harness install
+        run: cd harness && bun install
+
+      - name: rust-local atomic visibility consistency
+        run: cd harness && bun src/atomic-visibility-lane.ts --target rust-local --seed ${{ github.run_id }}
+
+      # run the pinned elle-cli list-append analysis on the atomic-visibility
+      # history just recorded above (no extra workload run). serializable holds
+      # because the workload's none-or-all visibility admits a serial order; a
+      # torn read would surface as a G-single/serializability anomaly.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: cache pinned Elle release
+        uses: actions/cache@v4
+        with:
+          path: .cache/elle-cli
+          key: elle-cli-${{ runner.os }}-${{ hashFiles('scripts/elle/lib.sh', 'scripts/elle/self-test.sh') }}
+          restore-keys: |
+            elle-cli-${{ runner.os }}-
+
+      - name: elle list-append on recorded atomic-visibility history
+        env:
+          ELLE_CACHE_DIR: ${{ github.workspace }}/.cache/elle-cli
+        run: scripts/elle/check-history.sh '' harness/target/consistency/elle-report
+
+      - name: rust-local exactly-once LMID consistency
+        run: cd harness && bun src/exactly-once-lmid-lane.ts --target rust-local --seed ${{ github.run_id }}
+
+      - name: rust-local HTTP pull cookie dialect conformance
+        run: cd harness && bun src/pull-dialect-conformance.ts --target rust-local
+
+      - name: upload rust-local consistency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-local-consistency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: harness/target/consistency/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: rust-local smoke (native host, 20 clients)
+        run: cd harness && bun src/smoke.ts --target rust-local --clients 20 --projects 3
+
+      - name: rust-local conformance shapes (stock zero-cache vs native host)
+        run: cd harness && bun src/shapes.ts --against rust-local
+
+      - name: rust-local randomized sweep
+        run: cd harness && bun src/sweep.ts --against rust-local --rounds 10 --seed ${{ github.run_id }}
+
+      - name: rust-local wake propagation
+        run: cd harness && bun src/propagation.ts --against rust-local --baseline none
+
+      - name: rust-local concurrent client storm
+        # Exercise one namespace with many live clients and mixed writers, then
+        # require every peer and a fresh late client to converge.
+        run: cd harness && bun src/storm.ts --target rust-local --clients 50
+
+      - name: rust-local query lifecycle
+        # desired-query membership: put/overlap/limit/related/delete/reconnect/
+        # permission/lost-response, with forbidden-row raw-store assertions
+        run: cd harness && bun src/queries.ts --against rust-local
+
+      - name: rust-local query differential (stock zero-cache)
+        # every corpus query's server-side membership must equal stock zero-cache
+        run: cd harness && bun src/query-diff.ts
+
+      - name: upload sweep regressions
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-local-sweep-regressions
+          path: harness/regressions/
+          if-no-files-found: ignore
+
+  # Release-blocking native fault evidence. Keep this separate from the broad
+  # rust-local conformance job so the fault matrix runs in parallel and has an
+  # independent failure signal/artifact.
+  rust-local-faults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - run: bun install --frozen-lockfile
+
+      - name: build sync runtime
+        run: bun run build:sync-runtime
+
+      - name: harness install
+        run: cd harness && bun install
+
+      - name: build sync-native fixture (release)
+        run: cargo build --release -p sync-native --bin sync-native-fixture
+
+      - name: pinned upstream corpus ledger
+        run: cd harness && bun src/corpus-check.ts
+
+      - name: portable upstream corpus (stock Zero, native Rust)
+        run: cd harness && bun src/upstream-corpus.ts --hosts stock-zero,sync-native
+
+      - name: rust-local protocol fuzz
+        run: cd harness && bun src/protocol-fuzz.ts --target rust-local --cases 500 --seed ${{ github.run_id }} --concurrency 20
+
+      - name: rust-local reconnect and retention recovery
+        run: cd harness && bun src/reconnect.ts --target rust-local
+
+      - name: rust-local eviction and process restart
+        run: cd harness && bun src/eviction.ts --target rust-local --clients 5
+
+      - name: rust-local transaction and storage faults
+        run: cd harness && bun src/storage-faults.ts --target rust-local
+
+      - name: rust-local backup and restore
+        run: cd harness && bun src/backup-restore.ts --target rust-local
+
+      - name: rust-local generated lifecycle state machine
+        run: |
+          cd harness
+          bun src/state-machine.ts --against rust-local --seed 1 --steps 18
+          bun src/state-machine.ts --against rust-local --nemesis --seed 36695003678 --replay regressions/pull-fault-prune-recovery.json --no-shrink
+          bun src/state-machine.ts --against rust-local --nemesis --seed ${{ github.run_id }} --steps 24
+
+      - name: upload native seeds and minimized traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-local-fault-regressions
+          path: |
+            harness/regressions/
+            harness/results/
+          if-no-files-found: error
+
+  # cloudflare durable-object host: build the wasm engine and run the full
+  # sync-cf-host suite. this is where the config cap-validation regression
+  # (config.test.mjs) and the workerd platform/integration contracts are
+  # enforced; without this job they run only on sol's machine.
+  sync-cf-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - uses: ./.github/actions/setup-wasm-pack
+
+      - run: bun install --frozen-lockfile
+
+      - name: sync-cf-host install
+        run: cd packages/lime-sync-cf-host && bun install
+
+      - name: build sync executor
+        run: bun run --cwd packages/lime-sync-executor build
+
+      # full suite: config cap-validation (bun:test) + workerd platform probe +
+      # wasm integration contract. build:wasm runs inside the package scripts.
+      - name: sync-cf-host suite
+        run: cd packages/lime-sync-cf-host && bun run test
+
+      # lime-sync durable object lanes against local workerd: migration replay
+      # cost, application push, and write attribution. the migration lane
+      # exercises the in-object schema replay, which no vitest lane reaches.
+      - name: lime-sync workerd lanes
+        run: |
+          cd packages/lime-sync
+          bun run build
+          bun run test:migration-workerd
+          bun run test:application-push-workerd
+          bun run test:write-attribution-workerd
+
+      # harness lanes import lime-sync-executor by package path, which resolves
+      # to dist. Bun reads the rest of the harness from TypeScript source, so
+      # nothing else in these lanes needs a build and it is easy to assume this
+      # one does not either.
+      - name: build sync-executor for harness lanes
+        run: bun run --cwd packages/lime-sync-executor build
+
+      - name: sync-cf-host push memory soak
+        run: |
+          cd packages/lime-sync-cf-host
+          bunx wrangler dev --config wrangler.toml --local --var ADMIN_KEY:push-memory-admin --port 8999 --log-level error --show-interactive-dev-session false > /tmp/push-memory-worker.log 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid"; wait "$worker_pid" || true' EXIT
+          for attempt in $(seq 1 150); do
+            if curl --fail --silent http://127.0.0.1:8999 > /dev/null; then break; fi
+            if [ "$attempt" = 150 ]; then cat /tmp/push-memory-worker.log; exit 1; fi
+            sleep 0.1
+          done
+          cd ../../harness
+          bun src/push-memory-soak.ts --target rust-cf --blocks 3 --ops 3000 --writers 12 --worker http://127.0.0.1:8999 --admin-key push-memory-admin
+
+      - name: rust-cf continuous fault and lifecycle gates
+        env:
+          ZHARNESS_RUST_CF_WORKER: http://127.0.0.1:8998
+          ZHARNESS_CF_ADMIN_KEY: rust-cf-fault-admin
+        run: |
+          cd packages/lime-sync-cf-host
+          bunx wrangler dev --config wrangler.toml --local --var ADMIN_KEY:rust-cf-fault-admin --port 8998 --log-level error --show-interactive-dev-session false > /tmp/rust-cf-fault-worker.log 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid"; wait "$worker_pid" || true' EXIT
+          for attempt in $(seq 1 150); do
+            if curl --fail --silent http://127.0.0.1:8998 > /dev/null; then break; fi
+            if [ "$attempt" = 150 ]; then cat /tmp/rust-cf-fault-worker.log; exit 1; fi
+            sleep 0.1
+          done
+          cd ../../harness
+          bun src/upstream-corpus.ts --hosts stock-zero,rust-cf
+          bun src/protocol-fuzz.ts --target rust-cf --cases 500 --seed ${{ github.run_id }} --concurrency 20
+          bun src/reconnect.ts --target rust-cf
+          bun src/streaming-fields.ts
+          bun src/eviction.ts --target rust-cf --clients 5
+          bun src/storage-faults.ts --target rust-cf
+          bun src/backup-restore.ts --target rust-cf
+          bun src/state-machine.ts --against rust-cf --seed 1 --steps 18
+          bun src/state-machine.ts --against rust-cf --seed ${{ github.run_id }} --steps 24
+
+      - name: upload rust-cf seeds and minimized traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-cf-fault-regressions
+          path: |
+            harness/regressions/
+            harness/results/
+          if-no-files-found: error
+
+  # This is the exact-identity evidence gate. GitHub does not start it until
+  # every required job above is green. The generator independently checks the
+  # run event/ref, job conclusions, build SHA, and immutable release-tag SHA
+  # before it can write "verified". A main SHA is a verified build; only an
+  # exact tag SHA is also a verified release. The ledger is uploaded as an
+  # artifact; the docs site (which deploys from natew/orez until it moves
+  # here) consumes it from there.
+  lime-sync-evidence:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - test
+      - harness
+      - rust
+      - rust-local
+      - rust-local-faults
+      - sync-cf-host
+      - sync-browser-host
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: test exact-SHA evidence identity
+        run: bun test scripts/generate-lime-sync-evidence.test.ts
+
+      - name: collect qualified fault traces
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-fault-regressions'
+          path: qualified-traces
+          merge-multiple: true
+
+      - name: publish minimized regression trace archive
+        id: regression-traces
+        uses: actions/upload-artifact@v4
+        with:
+          name: lime-sync-regression-traces-${{ github.sha }}
+          path: qualified-traces/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: generate exact-SHA evidence ledger
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LIME_SYNC_REGRESSION_TRACES_URL: ${{ steps.regression-traces.outputs.artifact-url }}
+          LIME_SYNC_REGRESSION_TRACES_PATH: qualified-traces
+        run: bun scripts/generate-lime-sync-evidence.ts generate
+
+      - name: validate exact-SHA release gate
+        env:
+          EXPECTED_EVIDENCE_SHA: ${{ github.sha }}
+        run: bun scripts/generate-lime-sync-evidence.ts check
+
+      - name: upload immutable evidence ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: lime-sync-evidence-${{ github.sha }}
+          path: data/lime-sync-evidence.json
+          if-no-files-found: error
+          retention-days: 90

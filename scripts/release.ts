@@ -1,0 +1,966 @@
+#!/usr/bin/env bun
+
+/**
+ * release script: check, build, publish the lime-sync package family, commit, tag, push.
+ * uses workspace:* protocol — at publish time we copy to tmp and replace with real versions.
+ */
+
+import { execFileSync, execSync } from 'node:child_process'
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  lstatSync,
+  renameSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { resolve, join, relative } from 'node:path'
+
+import {
+  orderReleasePackages,
+  selectLocalReleasePackages,
+  sharedReleasePackageDirectories,
+} from './release-package-order.js'
+import {
+  currentSyncNativePlatform,
+  prepareLauncherPackage,
+  preparePlatformPackage,
+  syncNativeVersion,
+} from './sync-native-package.js'
+import { SYNC_NATIVE_PLATFORMS } from './sync-native-platforms.js'
+import {
+  planSyncNativeRelease,
+  parseNpmMetadata,
+  syncNativeContractCheckMode,
+  syncNativeSourceRevision,
+} from './sync-native-release-plan.js'
+import { npmReleaseRegistry, verifyNpmRelease } from './verify-npm-release.js'
+
+const args = process.argv.slice(2)
+const knownArgs = new Set([
+  '--canary',
+  '--ci',
+  '--dry-run',
+  '--into',
+  '--major',
+  '--minor',
+  '--pack-only',
+  '--patch',
+  '--republish',
+  '--skip-all',
+  '--skip-build',
+  '--skip-test',
+])
+for (let index = 0; index < args.length; index++) {
+  const arg = args[index]
+  if (!knownArgs.has(arg)) {
+    throw new Error(`Unknown release argument: ${arg}`)
+  }
+  if (arg === '--into') index++
+}
+const dryRun = args.includes('--dry-run')
+const patch = args.includes('--patch')
+const minor = args.includes('--minor')
+const major = args.includes('--major')
+const canary = args.includes('--canary')
+const ci = args.includes('--ci')
+const rePublish = args.includes('--republish')
+const skipAll = args.includes('--skip-all')
+const skipTest = canary || args.includes('--skip-test') || skipAll || rePublish
+const skipBuild = args.includes('--skip-build') || skipAll || rePublish
+const packOnly = args.includes('--pack-only')
+const intoIdx = args.indexOf('--into')
+const into = intoIdx !== -1 ? args[intoIdx + 1] : null
+const trustedPublishing =
+  process.env.GITHUB_ACTIONS === 'true' &&
+  Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL) &&
+  Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+const nativeContractCheckMode = syncNativeContractCheckMode({
+  dryRun,
+  packOnly,
+  rePublish,
+  trustedPublishing,
+})
+const verifyNativeContract = !canary && nativeContractCheckMode !== 'skip'
+
+if (!patch && !minor && !major && !canary && !rePublish && !packOnly && !into) {
+  console.info(
+    'usage: bun scripts/release.ts --patch|--minor|--major|--canary|--republish [--dry-run] [--skip-build] [--skip-test] [--pack-only] [--into <dir>]\n       bun scripts/release.ts --pack-only [--patch|--minor|--major|--canary] [--skip-build]'
+  )
+  process.exit(1)
+}
+
+const root = resolve(import.meta.dirname, '..')
+
+function run(
+  cmd: string,
+  opts?: {
+    cwd?: string
+    env?: Record<string, string>
+    silent?: boolean
+  }
+) {
+  const cwd = opts?.cwd ?? root
+  if (!opts?.silent) console.info(`$ ${cmd}`)
+  return execSync(cmd, {
+    stdio: opts?.silent ? 'pipe' : 'inherit',
+    cwd,
+    env: { ...process.env, ...opts?.env },
+  })
+}
+
+function cleanRootDist() {
+  rmSync(resolve(root, 'dist'), { recursive: true, force: true })
+}
+
+// A local stable-release command is the explicit approval boundary. GitHub
+// owns the actual release so npm authentication, native matrix builds, and
+// retries all happen under trusted publishing without keeping a terminal open.
+if (!trustedPublishing && !dryRun && !packOnly && !into && !rePublish && !canary) {
+  if (!ci) {
+    throw new Error('stable releases run in GitHub Actions; rerun with --ci')
+  }
+  const releaseKind = patch ? 'patch' : minor ? 'minor' : major ? 'major' : undefined
+  if (!releaseKind) throw new Error('stable release kind is missing')
+  const branch = execFileSync('git', ['branch', '--show-current'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim()
+  if (branch !== 'main') throw new Error('stable releases must be dispatched from main')
+  const dirty = execFileSync('git', ['status', '--porcelain'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim()
+  if (dirty) {
+    throw new Error('commit or remove local changes before dispatching a stable release')
+  }
+  execFileSync('git', ['fetch', 'origin', 'main', '--no-tags'], {
+    cwd: root,
+    stdio: 'inherit',
+  })
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim()
+  const remoteMain = execFileSync('git', ['rev-parse', 'origin/main'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim()
+  if (head !== remoteMain) {
+    throw new Error(`local main ${head} is not current origin/main ${remoteMain}`)
+  }
+  const workflowUrl = execFileSync(
+    'gh',
+    [
+      'workflow',
+      'run',
+      'release-sync-native.yml',
+      '--ref',
+      'main',
+      '--raw-field',
+      `stable_bump=${releaseKind}`,
+    ],
+    { cwd: root, encoding: 'utf8' }
+  ).trim()
+  console.info(
+    '\nnative release dispatched; GitHub now owns the native and stable release'
+  )
+  if (workflowUrl) console.info(workflowUrl)
+  process.exit(0)
+}
+
+function bumpVersion(current: string): string {
+  if (rePublish) {
+    return current
+  }
+
+  // strip any existing prerelease tag (e.g. -canary.123)
+  const base = current.split('-')[0]
+  const [curMajor, curMinor, curPatch] = base.split('.').map(Number)
+
+  if (canary) {
+    // canary: use current version + timestamp suffix, no version bump
+    const timestamp = Date.now()
+    return `${curMajor}.${curMinor}.${curPatch}-canary.${timestamp}`
+  }
+
+  return major
+    ? `${curMajor + 1}.0.0`
+    : minor
+      ? `${curMajor}.${curMinor + 1}.0`
+      : `${curMajor}.${curMinor}.${curPatch + 1}`
+}
+
+// Stage a package into `destDir` ready to pack: its shipped files, plus a
+// package.json with workspace:* resolved to real versions and the
+// workspace-only fields dropped.
+//
+// Everything that packs goes through here. A tarball packed straight from the
+// repo tree carries `workspace:*` specifiers, which resolve to nothing once
+// installed: lime-sync's `./realtime` re-export of lime-sync-executor is one
+// import that then fails outright in the consumer.
+function stageForPack(
+  dir: string,
+  pkg: { name?: string; files?: string[]; scripts?: Record<string, string> },
+  version: string,
+  versionMap: Map<string, string>,
+  destDir: string
+): void {
+  for (const file of pkg.files ?? []) {
+    if (!existsSync(resolve(dir, file))) {
+      throw new Error(
+        `${pkg.name ?? dir}: package file '${file}' is missing. Build before publishing or remove --skip-build.`
+      )
+    }
+  }
+
+  const filesToCopy = [...(pkg.files ?? []), 'package.json']
+  if (existsSync(resolve(dir, 'README.md'))) filesToCopy.push('README.md')
+  if (existsSync(resolve(dir, 'LICENSE'))) filesToCopy.push('LICENSE')
+
+  for (const file of filesToCopy) {
+    const src = resolve(dir, file)
+    if (existsSync(src)) cpSync(src, join(destDir, file), { recursive: true })
+  }
+
+  const stagedPath = join(destDir, 'package.json')
+  const staged = JSON.parse(readFileSync(stagedPath, 'utf-8'))
+  staged.version = version
+  if (!rePublish) {
+    staged.releaseSourceCommit =
+      process.env.GITHUB_SHA ||
+      execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+  }
+  for (const depField of [
+    'dependencies',
+    'devDependencies',
+    'peerDependencies',
+    'optionalDependencies',
+  ]) {
+    const deps = staged[depField]
+    if (!deps) continue
+    for (const dep of Object.keys(deps)) {
+      if (deps[dep].startsWith('workspace:')) {
+        const resolved = versionMap.get(dep)
+        if (resolved) deps[dep] = resolved
+      }
+    }
+  }
+  // remove workspace-only fields. prepare builds workspace packages from the
+  // repo tree; this copy ships prebuilt dist and has no workspace tree, so npm
+  // must not run it here or for anyone installing the published git ref
+  delete staged.workspaces
+  if (staged.scripts) delete staged.scripts.prepare
+  writeFileSync(stagedPath, JSON.stringify(staged, null, 2) + '\n')
+}
+
+// Every installed copy of `name` under the target, not only the hoisted one.
+//
+// A consumer nests a second copy of a package whenever two of its dependencies
+// want different versions, and the nested one wins for anything resolving from
+// inside that subtree. Refreshing only the hoisted copy leaves the consumer
+// running two versions of the family at once with nothing to say so: team-machine
+// resolved lime-sync's realtime re-export into a stale nested sync-executor
+// that had no such export, and the import simply failed.
+function installedCopies(targetDir: string, name: string): string[] {
+  const found: string[] = []
+  const visit = (modulesDir: string) => {
+    if (!existsSync(modulesDir)) return
+    if (existsSync(join(modulesDir, name, 'package.json'))) {
+      found.push(join(modulesDir, name))
+    }
+    for (const entry of readdirSync(modulesDir, { withFileTypes: true })) {
+      // symlinks are skipped rather than followed: a linked package belongs to
+      // whatever tree it really lives in, and following them can cycle
+      if (!entry.isDirectory()) continue
+      const dir = join(modulesDir, entry.name)
+      if (entry.name === '.bun') {
+        for (const stored of readdirSync(dir, { withFileTypes: true })) {
+          if (stored.isDirectory()) visit(join(dir, stored.name, 'node_modules'))
+        }
+        continue
+      }
+      if (entry.name.startsWith('.')) continue
+      if (entry.name.startsWith('@')) {
+        for (const scoped of readdirSync(dir, { withFileTypes: true })) {
+          if (scoped.isDirectory()) visit(join(dir, scoped.name, 'node_modules'))
+        }
+        continue
+      }
+      visit(join(dir, 'node_modules'))
+    }
+  }
+  visit(join(targetDir, 'node_modules'))
+  return found
+}
+
+// --into <dir>: quick local release, packs each package and unpacks into target node_modules
+if (into) {
+  if (!into || into.startsWith('--')) {
+    console.error('missing directory argument for --into')
+    process.exit(1)
+  }
+  const targetDir = resolve(into.replace(/^~/, process.env.HOME!))
+
+  // gather packages the same way the normal flow does
+  const pkgDirs: { name: string; dir: string; pkg: any }[] = []
+  // the workspace root is private and never released; the family version
+  // comes from the lead lime-sync package in the normal flow below.
+  const sqlDir = resolve(root, 'sqlite-wasm')
+  const sqlPkgPath = resolve(sqlDir, 'package.json')
+  if (existsSync(sqlPkgPath)) {
+    const sqlPkg = JSON.parse(readFileSync(sqlPkgPath, 'utf-8'))
+    pkgDirs.push({ name: sqlPkg.name, dir: sqlDir, pkg: sqlPkg })
+  }
+
+  const syncHostDir = resolve(root, 'packages', 'lime-sync-cf-host')
+  const syncHostPkgPath = resolve(syncHostDir, 'package.json')
+  if (existsSync(syncHostPkgPath)) {
+    const syncHostPkg = JSON.parse(readFileSync(syncHostPkgPath, 'utf-8'))
+    pkgDirs.push({ name: syncHostPkg.name, dir: syncHostDir, pkg: syncHostPkg })
+  }
+
+  const syncExecutorDir = resolve(root, 'packages', 'lime-sync-executor')
+  const syncExecutorPkgPath = resolve(syncExecutorDir, 'package.json')
+  if (existsSync(syncExecutorPkgPath)) {
+    const syncExecutorPkg = JSON.parse(readFileSync(syncExecutorPkgPath, 'utf-8'))
+    pkgDirs.push({
+      name: syncExecutorPkg.name,
+      dir: syncExecutorDir,
+      pkg: syncExecutorPkg,
+    })
+  }
+
+  const orezLiteDir = resolve(root, 'packages', 'lime-sync')
+  const orezLitePkgPath = resolve(orezLiteDir, 'package.json')
+  if (existsSync(orezLitePkgPath)) {
+    const orezLitePkg = JSON.parse(readFileSync(orezLitePkgPath, 'utf-8'))
+    pkgDirs.push({
+      name: orezLitePkg.name,
+      dir: orezLiteDir,
+      pkg: orezLitePkg,
+    })
+  }
+
+  for (const packageDirectory of sharedReleasePackageDirectories) {
+    const dir = resolve(root, 'packages', packageDirectory)
+    const pkgPath = resolve(dir, 'package.json')
+    if (!existsSync(pkgPath)) continue
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+    pkgDirs.push({ name: pkg.name, dir, pkg })
+  }
+
+  const nativePlatform = currentSyncNativePlatform()
+  if (!nativePlatform) {
+    throw new Error(`sync-native does not support ${process.platform} ${process.arch}`)
+  }
+  for (const directory of ['lime-sync-native', `lime-sync-native-`]) {
+    const dir = resolve(root, 'packages', directory)
+    const pkg = JSON.parse(readFileSync(resolve(dir, 'package.json'), 'utf8'))
+    pkgDirs.push({ name: pkg.name, dir, pkg })
+  }
+  const copies = new Map(
+    pkgDirs.map(({ name }) => [name, installedCopies(targetDir, name)])
+  )
+  const installed = new Set(
+    pkgDirs.filter(({ name }) => copies.get(name)!.length > 0).map(({ name }) => name)
+  )
+  const selectedPkgDirs = selectLocalReleasePackages(pkgDirs, installed)
+  if (selectedPkgDirs.length === 0)
+    throw new Error('No upstream packages are installed in the target')
+  const tmpDir = mkdtempSync(join(tmpdir(), 'lime-sync-release-into-'))
+  const nativeNames = new Set(['lime-sync-native', nativePlatform.npmPackage])
+  let released = 0
+  try {
+    for (const item of selectedPkgDirs) {
+      if (nativeNames.has(item.name)) {
+        if (item.name === nativePlatform.npmPackage) {
+          if (!skipBuild) run('cargo build --release -p sync-native --bin sync-native')
+          const staged = resolve(tmpDir, 'native-platform')
+          preparePlatformPackage(
+            nativePlatform.id,
+            resolve(root, 'target', 'release', nativePlatform.executable),
+            staged,
+            syncNativeVersion()
+          )
+          item.dir = staged
+        } else {
+          const staged = resolve(tmpDir, 'native-launcher')
+          prepareLauncherPackage(staged, syncNativeVersion())
+          item.dir = staged
+        }
+      } else if (item.name === 'bedrock-sqlite') {
+        run('make -B dist/package.json', { cwd: item.dir })
+      } else if (!skipBuild) {
+        if (item.name === 'lime-sync-cf-host') {
+          run('bun run build:wasm && bun run build:runtime', { cwd: item.dir })
+        } else if (item.name === 'lime-sync') {
+          run(
+            'bun run build:runtime && bun run --cwd ../lime-sync-browser-host build:runtime',
+            { cwd: item.dir }
+          )
+        } else if (item.pkg.scripts?.build) {
+          run('bun run build', { cwd: item.dir })
+        }
+      }
+    }
+
+    // --into ships the versions already in the tree; nothing is bumped here
+    const versionMap = new Map(
+      pkgDirs.map(({ name, pkg }) => [name, pkg.version as string])
+    )
+
+    for (const { name, dir, pkg } of selectedPkgDirs) {
+      // a dependency the consumer does not have yet lands hoisted
+      const destDirs = copies.get(name)!
+      if (destDirs.length === 0) destDirs.push(join(targetDir, 'node_modules', name))
+
+      const stageDir = join(tmpDir, 'stage', name)
+      mkdirSync(stageDir, { recursive: true })
+      stageForPack(dir, pkg, pkg.version, versionMap, stageDir)
+      execFileSync('bun', ['pm', 'pack', '--ignore-scripts', '--destination', tmpDir], {
+        cwd: stageDir,
+        stdio: 'pipe',
+      })
+
+      const files = readdirSync(tmpDir)
+      const prefix = name.replace('@', '').replace('/', '-')
+      const packed = files.find((f) => f.startsWith(prefix) && f.endsWith('.tgz'))
+
+      if (!packed) throw new Error(`${name}: pack produced no tgz`)
+
+      const tgzPath = join(tmpDir, packed)
+      for (const [index, destDir] of destDirs.entries()) {
+        const extracted = join(tmpDir, `install-${released}-${index}`)
+        mkdirSync(extracted)
+        execFileSync('tar', ['-xzf', tgzPath, '-C', extracted, '--strip-components=1'])
+        if (existsSync(destDir) && !lstatSync(destDir).isSymbolicLink()) {
+          const nested = join(destDir, 'node_modules')
+          if (existsSync(nested)) renameSync(nested, join(extracted, 'node_modules'))
+        }
+        rmSync(destDir, { recursive: true, force: true })
+        mkdirSync(resolve(destDir, '..'), { recursive: true })
+        renameSync(extracted, destDir)
+      }
+      rmSync(tgzPath)
+      released++
+      const nested = destDirs.length > 1 ? ` (${destDirs.length} copies)` : ''
+      console.info(`  ✓ ${name}${nested}`)
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true })
+  }
+
+  console.info(`\nreleased ${released} package(s) into ${targetDir}`)
+  process.exit(0)
+}
+
+// workspace packages: [dir, pkgPath, pkg, nextVersion]
+interface WorkspacePkg {
+  dir: string
+  originalVersion: string
+  pkgPath: string
+  pkg: any
+  next: string
+}
+
+const packages: WorkspacePkg[] = []
+
+// the whole lime-sync family ships one version, led by the public package.
+// the workspace root is private and never published.
+const leadPkgPath = resolve(root, 'packages', 'lime-sync', 'package.json')
+const leadPkg = JSON.parse(readFileSync(leadPkgPath, 'utf-8'))
+const limeNext = bumpVersion(leadPkg.version)
+
+// bedrock-sqlite (workspace) — skip if wasm dist not built
+const sqliteWasmDir = resolve(root, 'sqlite-wasm')
+const sqlitePkgPath = resolve(sqliteWasmDir, 'package.json')
+const sqliteDistExists = existsSync(resolve(sqliteWasmDir, 'dist', 'sqlite3.wasm'))
+if (existsSync(sqlitePkgPath) && sqliteDistExists) {
+  const sqlitePkg = JSON.parse(readFileSync(sqlitePkgPath, 'utf-8'))
+  packages.push({
+    dir: sqliteWasmDir,
+    originalVersion: sqlitePkg.version,
+    pkgPath: sqlitePkgPath,
+    pkg: sqlitePkg,
+    next: limeNext,
+  })
+} else if (existsSync(sqlitePkgPath) && !sqliteDistExists) {
+  console.info('skipping bedrock-sqlite (no wasm dist built)')
+}
+
+// lime-sync-cf-host — built CF DO host and standalone query runtime plus
+// generated wasm. skip if wasm isn't built — the release build step builds it.
+const cfHostDir = resolve(root, 'packages', 'lime-sync-cf-host')
+const cfHostPkgPath = resolve(cfHostDir, 'package.json')
+if (existsSync(cfHostPkgPath)) {
+  const cfHostPkg = JSON.parse(readFileSync(cfHostPkgPath, 'utf-8'))
+  packages.push({
+    dir: cfHostDir,
+    originalVersion: cfHostPkg.version,
+    pkgPath: cfHostPkgPath,
+    pkg: cfHostPkg,
+    next: limeNext,
+  })
+}
+
+// lime-sync-executor — host-neutral mutation execution and application adapters.
+const syncExecutorDir = resolve(root, 'packages', 'lime-sync-executor')
+const syncExecutorPkgPath = resolve(syncExecutorDir, 'package.json')
+if (existsSync(syncExecutorPkgPath)) {
+  const syncExecutorPkg = JSON.parse(readFileSync(syncExecutorPkgPath, 'utf-8'))
+  packages.push({
+    dir: syncExecutorDir,
+    originalVersion: syncExecutorPkg.version,
+    pkgPath: syncExecutorPkgPath,
+    pkg: syncExecutorPkg,
+    next: limeNext,
+  })
+}
+
+// lime-sync — public SQLite and Rust sync engine.
+const orezLiteDir = resolve(root, 'packages', 'lime-sync')
+const orezLitePkgPath = resolve(orezLiteDir, 'package.json')
+if (existsSync(orezLitePkgPath)) {
+  const orezLitePkg = JSON.parse(readFileSync(orezLitePkgPath, 'utf-8'))
+  packages.push({
+    dir: orezLiteDir,
+    originalVersion: orezLitePkg.version,
+    pkgPath: orezLitePkgPath,
+    pkg: orezLitePkg,
+    next: limeNext,
+  })
+}
+
+// the lime-sync family is fully enumerated above; there are no extra shared
+// packages on this release train (the variable stays so --into keeps working).
+for (const packageDirectory of sharedReleasePackageDirectories) {
+  const dir = resolve(root, 'packages', packageDirectory)
+  const pkgPath = resolve(dir, 'package.json')
+  if (!existsSync(pkgPath)) continue
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+  packages.push({
+    dir,
+    originalVersion: pkg.version,
+    pkgPath,
+    pkg,
+    next: limeNext,
+  })
+}
+
+packages.splice(0, packages.length, ...orderReleasePackages(packages))
+
+// plain --pack-only preserves current versions; an explicit release kind packs
+// the next unpublished version without mutating source manifests.
+if (packOnly && !patch && !minor && !major && !canary) {
+  for (const p of packages) {
+    p.next = p.pkg.version
+  }
+}
+
+// version map for resolving workspace:* at publish time
+const versionMap = new Map(packages.map((p) => [p.pkg.name, p.next]))
+if (canary && !rePublish && !packOnly && !dryRun) {
+  const response = await fetch('https://registry.npmjs.org/lime-sync/canary')
+  if (response.ok) {
+    const metadata = (await response.json()) as { releaseSourceCommit?: string }
+    const sourceCommit =
+      process.env.GITHUB_SHA ||
+      execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+    if (metadata.releaseSourceCommit === sourceCommit) {
+      console.info(
+        `Canary already published from ${sourceCommit}; skipping duplicate release.`
+      )
+      process.exit(0)
+    }
+  }
+}
+const nativeLauncherPkg = JSON.parse(
+  readFileSync(resolve(root, 'packages', 'lime-sync-native', 'package.json'), 'utf8')
+)
+let nativeReleaseVersion = process.env.LIME_SYNC_NATIVE_VERSION
+if (canary && !rePublish && !packOnly && !dryRun && !nativeReleaseVersion) {
+  const latest = parseNpmMetadata(
+    execFileSync(
+      'npm',
+      [
+        'view',
+        'lime-sync-native@latest',
+        'version',
+        'orezSourceCommit',
+        'orezNativeSourceRevision',
+        '--json',
+        '--prefer-online',
+      ],
+      { encoding: 'utf8' }
+    )
+  )
+  if (latest.orezNativeSourceRevision !== syncNativeSourceRevision()) {
+    console.info(
+      'Skipping canary until the native release publishes this source. Local --into can build it immediately.'
+    )
+    process.exit(0)
+  }
+  const platforms = await Promise.all(
+    SYNC_NATIVE_PLATFORMS.map(async ({ npmPackage }) => {
+      const response = await fetch(
+        `https://registry.npmjs.org/${encodeURIComponent(npmPackage)}/${latest.version}`
+      )
+      if (!response.ok) return false
+      const metadata = (await response.json()) as typeof latest
+      return (
+        metadata.orezSourceCommit === latest.orezSourceCommit &&
+        metadata.orezNativeSourceRevision === latest.orezNativeSourceRevision
+      )
+    })
+  )
+  if (platforms.some((complete) => !complete)) {
+    console.info(
+      'Skipping canary until every native platform package is published from the same source.'
+    )
+    process.exit(0)
+  }
+  nativeReleaseVersion = latest.version
+}
+if (!nativeReleaseVersion && nativeContractCheckMode === 'select-and-verify') {
+  const nativePlatform = currentSyncNativePlatform()
+  if (!nativePlatform) {
+    throw new Error(`sync-native does not support ${process.platform} ${process.arch}`)
+  }
+  const localBinary = resolve(root, 'target', 'release', nativePlatform.executable)
+  run('cargo build --locked --release -p sync-native --bin sync-native')
+  const nativePlan = planSyncNativeRelease(localBinary)
+  if (nativePlan.publish) {
+    throw new Error(`native OIDC release has not completed: ${nativePlan.reason}`)
+  }
+  nativeReleaseVersion = nativePlan.version
+  console.info(`Using complete native OIDC release ${nativeReleaseVersion}`)
+}
+nativeReleaseVersion ||= nativeLauncherPkg.version
+if (!/^\d+\.\d+\.\d+$/.test(nativeReleaseVersion)) {
+  throw new Error(`invalid LIME_SYNC_NATIVE_VERSION: ${nativeReleaseVersion}`)
+}
+versionMap.set(nativeLauncherPkg.name, nativeReleaseVersion)
+
+for (const p of packages) {
+  if (packOnly) {
+    console.info(`  ${p.pkg.name}: ${p.next}`)
+  } else {
+    console.info(`  ${p.pkg.name}: ${p.pkg.version} -> ${p.next}`)
+  }
+}
+
+if (!packOnly && !dryRun && !trustedPublishing) {
+  try {
+    run('npm whoami', { silent: true })
+  } catch {
+    console.info(
+      '\nnpm authentication is required before publishing. Opening npm login...'
+    )
+    run('npm login')
+
+    try {
+      run('npm whoami', { silent: true })
+    } catch (error) {
+      throw new Error('npm login completed, but npm whoami is still unauthenticated.', {
+        cause: error,
+      })
+    }
+  }
+}
+
+// check: format, lint, types, tests
+if (!rePublish && existsSync(sqlitePkgPath))
+  run('make -B dist/package.json', { cwd: sqliteWasmDir })
+if (!packOnly && !rePublish && !canary) {
+  console.info('\nchecking...')
+  run('bun run format')
+  run('bun run format:check')
+  run('bun run lint')
+  if (skipBuild) console.info('skipping build-dependent checks')
+  else run('bun run check')
+  if (!skipTest) {
+    run('bun run test')
+    run('bun run test:sync-browser-host')
+    run('bun run test:sync-cf-host')
+    if (packages.length > 1) {
+      run('bun install', { cwd: sqliteWasmDir })
+      run('bun run test', { cwd: sqliteWasmDir })
+    }
+  }
+}
+
+// the npm sync-native host must read the same durable contract as this tree.
+// a version string cannot prove that: npm 0.1.2 shipped without the packed
+// ledger while a source build calling itself 0.1.2 shipped with it, and the
+// skew served lastMutationID 0 to every local client with nothing failing
+// (soot factory defect #49, 2026-08-06). compare the schema revision the two
+// binaries actually report. the stable OIDC workflow publishes native first
+// and passes the exact version selected by its contract-aware release plan.
+if (verifyNativeContract) {
+  console.info('\nchecking npm sync-native contract...')
+  const nativePlatform = currentSyncNativePlatform()
+  if (!nativePlatform) {
+    throw new Error(`sync-native does not support ${process.platform} ${process.arch}`)
+  }
+  const localBinary = resolve(root, 'target', 'release', nativePlatform.executable)
+  if (!skipBuild) run('cargo build --release -p sync-native --bin sync-native')
+  if (!existsSync(localBinary)) {
+    throw new Error(
+      `sync-native release binary is missing at ${localBinary}. Build before publishing or remove --skip-build.`
+    )
+  }
+  // "sync-native <pkg version> <schema revision>"; an old binary prints no
+  // revision at all, which compares as a mismatch, which is correct.
+  const revisionOf = (versionOutput: string) =>
+    versionOutput.trim().split(/\s+/).slice(2).join(' ')
+  const localRevision = revisionOf(
+    execSync(`${localBinary} --version`, { encoding: 'utf8' })
+  )
+  const guardDir = mkdtempSync(join(tmpdir(), 'lime-sync-native-guard-'))
+  run(`npm pack ${nativePlatform.npmPackage}@${nativeReleaseVersion} --silent`, {
+    cwd: guardDir,
+  })
+  run('tar -xzf *.tgz', { cwd: guardDir })
+  const publishedBinary = resolve(guardDir, 'package', 'bin', nativePlatform.executable)
+  chmodSync(publishedBinary, 0o755)
+  const publishedRevision = revisionOf(
+    execSync(`${publishedBinary} --version`, { encoding: 'utf8' })
+  )
+  rmSync(guardDir, { recursive: true, force: true })
+  if (publishedRevision !== localRevision) {
+    throw new Error(
+      `npm ${nativePlatform.npmPackage} reads contract '${publishedRevision || 'none'}' but this tree needs '${localRevision}'. ` +
+        `The OIDC native release selected ${nativeReleaseVersion}, but it did not publish the required contract.`
+    )
+  }
+}
+
+if (rePublish) {
+  console.info('\nrepublishing existing package artifacts')
+} else if (skipBuild) {
+  console.info('\nskipping build; using existing package artifacts')
+} else {
+  console.info('\nbuilding...')
+  cleanRootDist()
+  run('bun run build')
+  if (!canary)
+    run('bun run build:dist', { cwd: resolve(root, 'packages', 'lime-sync-cf-host') })
+}
+
+// bump versions in source (skip for --pack-only and --canary)
+if (!packOnly && !canary && !rePublish) {
+  for (const p of packages) {
+    p.pkg.version = p.next
+    writeFileSync(p.pkgPath, JSON.stringify(p.pkg, null, 2) + '\n')
+  }
+
+  // regenerate lockfile (workspace:* resolves locally, no npm needed)
+  run('bun install')
+}
+
+if (dryRun) {
+  console.info(`\n[dry-run] would publish:`)
+  for (const p of packages) {
+    console.info(`  ${p.pkg.name}@${p.next}`)
+  }
+  if (!rePublish) {
+    // revert versions
+    for (const p of packages) {
+      const original = JSON.parse(readFileSync(p.pkgPath, 'utf-8'))
+      original.version = p.originalVersion
+      writeFileSync(p.pkgPath, JSON.stringify(original, null, 2) + '\n')
+    }
+    run('bun install')
+  }
+  process.exit(0)
+}
+
+// publish each package from a tmp copy with workspace:* resolved
+const tmpBase = mkdtempSync(join(tmpdir(), 'lime-sync-publish-'))
+console.info(`\n${packOnly ? 'packing to' : 'publishing from'} ${tmpBase}`)
+
+const preparedPackages: Array<{
+  name: string
+  version: string
+  cwd: string
+  source: WorkspacePkg
+}> = []
+
+for (const p of packages) {
+  const name = p.pkg.name
+  const tmpDir = join(tmpBase, name)
+
+  if (packOnly) {
+    stageForPack(p.dir, p.pkg, p.next, versionMap, tmpDir)
+    console.info(`\npacking ${name}@${p.next}...`)
+    run('npm pack', { cwd: tmpDir })
+  } else {
+    preparedPackages.push({ name, version: p.next, cwd: tmpDir, source: p })
+  }
+}
+
+if (packOnly) {
+  console.info(`\npacked to ${tmpBase}`)
+  process.exit(0)
+}
+
+function isPublished({ name, version }: (typeof preparedPackages)[number]) {
+  try {
+    const output = run(
+      `npm view ${name}@${version} version --json --prefer-online --registry=${npmReleaseRegistry}`,
+      {
+        cwd: tmpBase,
+        silent: true,
+      }
+    ).toString()
+    const found = JSON.parse(output.trim())
+    return found === version || (Array.isArray(found) && found.includes(version))
+  } catch (error) {
+    const details = error as { stdout?: Buffer; stderr?: Buffer }
+    const message = `${String(error)}\n${details.stdout || ''}\n${details.stderr || ''}`
+    if (/E404|404 Not Found|is not in this registry/i.test(message)) {
+      return false
+    }
+    throw new Error(`Could not verify ${name}@${version} on npm:\n${message}`)
+  }
+}
+
+console.info(`Checking ${preparedPackages.length} package versions on npm...`)
+const pendingPackages = preparedPackages.filter((pkg) => {
+  if (isPublished(pkg)) {
+    console.info(`Skipping ${pkg.name}: this version is already published`)
+    return false
+  }
+  return true
+})
+
+if (pendingPackages.length > 0) {
+  const tag = canary ? '--tag canary' : ''
+
+  for (const { cwd, source } of pendingPackages) {
+    stageForPack(source.dir, source.pkg, source.next, versionMap, cwd)
+  }
+
+  try {
+    if (trustedPublishing) {
+      // each npm process exchanges one package-scoped OIDC token. npm's
+      // workspace publisher reuses its first token and package two rejects it.
+      if (canary) {
+        for (let index = 0; index < pendingPackages.length; index += 6) {
+          await Promise.all(
+            pendingPackages.slice(index, index + 6).map(async (pkg) => {
+              const child = Bun.spawn(
+                [
+                  'npm',
+                  'publish',
+                  '--ignore-scripts',
+                  '--access',
+                  'public',
+                  `--registry=${npmReleaseRegistry}`,
+                  '--tag',
+                  'canary',
+                ],
+                { cwd: pkg.cwd, stdout: 'inherit', stderr: 'inherit' }
+              )
+              if ((await child.exited) !== 0)
+                throw new Error(`Publish failed for ${pkg.name}`)
+            })
+          )
+        }
+      } else {
+        for (const pkg of pendingPackages) {
+          run(
+            `npm publish --ignore-scripts --access public --registry=${npmReleaseRegistry} ${tag}`.trim(),
+            { cwd: pkg.cwd }
+          )
+        }
+      }
+    } else {
+      if (!ci && process.stdin.isTTY && process.stdout.isTTY) {
+        console.info(
+          'npm will open the browser for 2FA once. Select “do not challenge for the next 5 minutes” so the same short-lived approval can publish the remaining packages.'
+        )
+      }
+      writeFileSync(
+        join(tmpBase, 'package.json'),
+        JSON.stringify(
+          {
+            name: 'lime-sync-release',
+            private: true,
+            workspaces: pendingPackages.map((pkg) => relative(tmpBase, pkg.cwd)),
+          },
+          null,
+          2
+        ) + '\n'
+      )
+      const webAuthCache = join(root, 'scripts', 'cache-npm-webauth.cjs')
+      const nodeOptions = [process.env.NODE_OPTIONS, `--require=${webAuthCache}`]
+        .filter(Boolean)
+        .join(' ')
+      run(
+        `npm publish --workspaces --ignore-scripts --access public --registry=${npmReleaseRegistry} ${tag}`.trim(),
+        {
+          cwd: tmpBase,
+          env: { NODE_OPTIONS: nodeOptions },
+        }
+      )
+    }
+  } catch (error) {
+    let postflight = pendingPackages.map((pkg) => ({
+      pkg,
+      published: isPublished(pkg),
+    }))
+    if (postflight.some(({ published }) => !published)) {
+      // npm can return before its package metadata is visible to `npm view`.
+      // give successful workspaces one propagation window before reporting them.
+      await Bun.sleep(10_000)
+      postflight = postflight.map(({ pkg, published }) => ({
+        pkg,
+        published: published || isPublished(pkg),
+      }))
+    }
+    const completed = postflight.filter(({ published }) => published)
+    const missing = postflight.filter(({ published }) => !published)
+    throw new Error(
+      `Publish stopped after ${completed.length} packages${completed.length > 0 ? ` (${completed.map(({ pkg }) => pkg.name).join(', ')})` : ''}. Still missing:\n${missing.map(({ pkg }) => pkg.name).join('\n')}\n\nRe-run with --republish to retry only these packages with the existing build.`,
+      { cause: error }
+    )
+  }
+}
+
+// npm can accept an upload while the version is still being processed.
+// every release must prove consumers can resolve and download all packages.
+await verifyNpmRelease(preparedPackages, { tag: canary ? 'canary' : undefined })
+
+// git commit + tag + push (skip for canary releases)
+if (!canary) {
+  const gitTag = `v${limeNext}`
+  // stage ONLY the files this release legitimately changed: the bumped
+  // package.json of each workspace package plus the regenerated lockfile.
+  // never `git add -A` — this checkout hosts concurrent agent sessions, and a
+  // blanket add sweeps a co-tenant's uncommitted WIP into the version commit
+  // (and any dirty source compiled into the just-published dist). real
+  // incident: v0.4.31 swept an in-flight src/config.ts edit.
+  const versionPaths = [
+    ...packages.map((p) => p.pkgPath),
+    resolve(root, 'bun.lock'),
+  ].filter((p) => existsSync(p))
+  const pathspec = versionPaths.map((p) => `'${p}'`).join(' ')
+  run(`git add ${pathspec}`)
+  run(`git commit -m "${gitTag}" -- ${pathspec}`)
+  run(`git tag ${gitTag}`)
+  run('git push origin HEAD:refs/heads/main')
+  run(`git push origin ${gitTag}`)
+}
+
+console.info(`\nreleased${canary ? ' (canary)' : ''}:`)
+for (const p of packages) {
+  console.info(`  ${p.pkg.name}@${p.next}`)
+}

@@ -1,0 +1,253 @@
+name: Release sync-native
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stable_bump:
+        description: Stable release to dispatch after every native package succeeds
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: sync-native-release
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.candidate.outputs.release }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: select latest main build
+        id: candidate
+        run: bash scripts/release-candidate.sh
+
+  plan:
+    needs: candidate
+    if: needs.candidate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      publish: ${{ steps.plan.outputs.publish }}
+      source_revision: ${{ steps.plan.outputs.source_revision }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Wait for exact commit CI
+        run: >-
+          bun scripts/ops/watch-ci.ts
+          --sha "$GITHUB_SHA"
+          --workflow ci.yml
+          --interval 120
+          --timeout 2400
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: npm install --global npm@12.0.1
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.94.0
+
+      - name: Validate package plan
+        id: plan
+        shell: bash
+        run: |
+          if [ '${{ github.ref }}' != 'refs/heads/main' ]; then
+            echo 'sync-native releases must run from main' >&2
+            exit 1
+          fi
+          git fetch origin main --no-tags
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo 'sync-native releases must use the current main commit' >&2
+            exit 1
+          fi
+          bun scripts/sync-native-package.ts check
+          bun test \
+            scripts/sync-native-package.test.ts \
+            scripts/release-package-order.test.ts \
+            scripts/sync-native-release-plan.test.ts
+          cargo build --locked --release -p sync-native --bin sync-native
+          plan="$(bun scripts/sync-native-release-plan.ts target/release/sync-native)"
+          echo "$plan"
+          {
+            echo "version=$(jq -r .version <<< "$plan")"
+            echo "publish=$(jq -r .publish <<< "$plan")"
+            echo "source_revision=$(jq -r .localSourceRevision <<< "$plan")"
+            echo "matrix=$(bun scripts/sync-native-package.ts matrix darwin-arm64)"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  launcher:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: npm install --global npm@12.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.94.0
+
+      - name: Publish launcher before platform binaries
+        shell: bash
+        run: |
+          version='${{ needs.plan.outputs.version }}'
+          bun scripts/sync-native-package.ts prepare-launcher \
+            .release/launcher \
+            "$version" \
+            '${{ github.sha }}' \
+            '${{ needs.plan.outputs.source_revision }}'
+          mkdir -p .release/packed
+          npm pack \
+            .release/launcher \
+            --pack-destination .release/packed \
+            --silent
+          if npm view "lime-sync-native@$version" version --json >/dev/null 2>&1; then
+            published_commit="$(npm view "lime-sync-native@$version" orezSourceCommit)"
+            if [ "$published_commit" != '${{ github.sha }}' ]; then
+              echo "lime-sync-native@$version came from $published_commit, not ${{ github.sha }}" >&2
+              exit 1
+            fi
+            published_revision="$(npm view "lime-sync-native@$version" orezNativeSourceRevision)"
+            if [ "$published_revision" != '${{ needs.plan.outputs.source_revision }}' ]; then
+              echo "lime-sync-native@$version carries native source $published_revision, not ${{ needs.plan.outputs.source_revision }}" >&2
+              exit 1
+            fi
+            echo "lime-sync-native@$version already has this source commit"
+          else
+            npm publish .release/launcher --ignore-scripts --access public
+          fi
+
+  mac-arm64:
+    needs: [plan, launcher]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/build-sync-native
+        with:
+          id: darwin-arm64
+          target: aarch64-apple-darwin
+          executable: sync-native
+          version: ${{ needs.plan.outputs.version }}
+          source-revision: ${{ needs.plan.outputs.source_revision }}
+
+      - uses: ./.github/actions/publish-sync-native
+        with:
+          version: ${{ needs.plan.outputs.version }}
+
+  remaining-platforms:
+    needs: [plan, launcher]
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/build-sync-native
+        with:
+          id: ${{ matrix.id }}
+          target: ${{ matrix.target }}
+          executable: ${{ matrix.executable }}
+          version: ${{ needs.plan.outputs.version }}
+          source-revision: ${{ needs.plan.outputs.source_revision }}
+          libc: ${{ matrix.libc }}
+
+      - uses: ./.github/actions/publish-sync-native
+        with:
+          version: ${{ needs.plan.outputs.version }}
+          libc: ${{ matrix.libc }}
+
+  dispatch-stable:
+    needs: [plan, launcher, mac-arm64, remaining-platforms]
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.stable_bump != 'none' &&
+        needs.plan.result == 'success' &&
+        (
+          needs.plan.outputs.publish != 'true' ||
+          (
+            needs.launcher.result == 'success' &&
+            needs['mac-arm64'].result == 'success' &&
+            needs['remaining-platforms'].result == 'success'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch stable OIDC release
+        shell: bash
+        run: |
+          current_main="$(gh api "/repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "$current_main" != "$GITHUB_SHA" ]; then
+            echo "main moved from $GITHUB_SHA to $current_main during native publishing" >&2
+            exit 1
+          fi
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            --raw-field 'bump=${{ inputs.stable_bump }}'
+        env:
+          GH_TOKEN: ${{ github.token }}
