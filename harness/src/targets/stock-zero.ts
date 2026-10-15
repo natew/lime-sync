@@ -10,9 +10,9 @@ import { join, resolve } from 'node:path'
 import { Zero } from '@rocicorp/zero'
 import postgres from 'postgres'
 
-import { findPortBlock } from '../../../src/port.js'
 import { startAppServer } from '../app-server.js'
 import { DDL, SEED, jsonColumns, mutators, permissions, schema } from '../fixture.js'
+import { findPortBlock } from '../ports.js'
 
 import type { Rows, SyncTarget } from '../target.js'
 

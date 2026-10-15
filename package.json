@@ -34,17 +34,8 @@
     "check:all": "bun run lint && bun run format:check && bun run check && bun run test",
     "release": "bun scripts/release.ts",
     "release:native:bootstrap": "bun scripts/bootstrap-sync-native-packages.ts",
-    "perf:load": "bun run perf/load/harness.ts",
-    "perf:memory": "bun run perf/memory/profile.ts",
-    "perf:bench": "bun run perf/scripts/bench-all.ts",
-    "perf:overhead": "bun run perf/scripts/bench-proxy-overhead.ts",
-    "perf:soak": "bun run perf/stability/soak.ts",
-    "perf:crash": "bun run perf/stability/crash-recovery.ts",
-    "perf:correctness": "bun test perf/stability/correctness.test.ts",
-    "perf:diagnose": "bun run perf/scripts/diagnose.ts",
-    "perf:quick": "bun run perf/scripts/quick-check.ts",
-    "perf:all": "bun run perf:bench && bun run perf:overhead && bun run perf:correctness && bun run perf:crash",
-    "perf:ci": "bun run perf:bench -- --output=perf/reports/bench.json && bun run perf:overhead && bun run perf:correctness"
+    "perf:cf-do": "bun run perf/scripts/bench-cf-do.ts",
+    "perf:diagnose": "bun run perf/scripts/diagnose.ts"
   },
   "patchedDependencies": {
     "@rocicorp/zero@1.9.0": "patches/@rocicorp%2Fzero@1.9.0.patch"
