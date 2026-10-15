@@ -28,7 +28,7 @@ const baseURL = externalURL ?? `http://127.0.0.1:${port}`
 if (server) {
   for (let attempt = 0; ; attempt++) {
     try {
-      const response = await fetch(baseURL)
+      const response = await fetch(baseURL, { signal: AbortSignal.timeout(1_000) })
       if (response.ok) break
     } catch {}
     if (attempt >= 150) throw new Error('wrangler workerd did not become ready')
