@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from '../lime-sync-cf-host/test-ports.ts'
 import { defineCloudflareConfig } from './src/cf-deploy/config.ts'
 import { buildMigrationModuleSource } from './src/cf-deploy/migration.ts'
 

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from '../lime-sync-cf-host/test-ports.ts'
 
 const fixture = mkdtempSync(join(import.meta.dirname, '.application-push-workerd-'))
 const port = await findPort(0)
