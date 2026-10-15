@@ -553,6 +553,11 @@ jobs:
           bun run test:application-push-workerd
           bun run test:write-attribution-workerd
 
+      # harness is its own package outside the workspace, so its dependencies
+      # (postgres, embedded-postgres) need their own install before any lane.
+      - name: harness install
+        run: cd harness && bun install
+
       # harness lanes import lime-sync-executor by package path, which resolves
       # to dist. Bun reads the rest of the harness from TypeScript source, so
       # nothing else in these lanes needs a build and it is easy to assume this
