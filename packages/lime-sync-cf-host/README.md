@@ -353,7 +353,7 @@ See [Cloudflare Worker limits](https://developers.cloudflare.com/workers/platfor
 
 ## Deployment
 
-`wrangler.toml` is checked in with Worker name `orez-rust-sync`, SQLite Durable
+`wrangler.toml` is checked in with Worker name `lime-sync`, SQLite Durable
 Object class `SyncDurableObject`, and account `6afff1f79e2fd12f1cfd1bfe1dfd08d1`.
 The deployed test version used for this M3 pass was
 `871a13df-7c3b-4e1c-bc90-c3cbd00f2dea` at

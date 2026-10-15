@@ -1,4 +1,4 @@
-name = "orez-rust-sync-ingest-harness"
+name = "lime-sync-ingest-harness"
 main = "../lime-sync/test-workers/ingest-harness-worker.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
@@ -26,12 +26,12 @@ class_name = "ZeroDO"
 
 [[services]]
 binding = "DATA"
-service = "orez-rust-sync-ingest-harness"
+service = "lime-sync-ingest-harness"
 entrypoint = "DataService"
 
 [[services]]
 binding = "APP"
-service = "orez-rust-sync-ingest-harness"
+service = "lime-sync-ingest-harness"
 entrypoint = "AppService"
 
 [[migrations]]

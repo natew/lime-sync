@@ -1,4 +1,4 @@
-name = "orez-rust-sync"
+name = "lime-sync"
 main = "src/harness-worker.ts"
 compatibility_date = "2026-06-01"
 # harness-worker imports node:util; without this the packaged integration and
