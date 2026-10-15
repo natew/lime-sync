@@ -6,11 +6,11 @@ import { defineStreamingFields } from 'lime-sync-executor/realtime'
 import {
   createSyncDurableObject,
   createSyncWorker,
-} from '../../sync-cf-host/src/index.js'
+} from '../../lime-sync-cf-host/src/index.js'
 import { createApplicationSqlClient } from '../src/cf-do/application-sql.js'
 import { createOrezDataWorker } from '../src/cf-do/lite-data-worker.js'
 
-import type { SyncHostConfig, SyncHostEnv } from '../../sync-cf-host/src/index.js'
+import type { SyncHostConfig, SyncHostEnv } from '../../lime-sync-cf-host/src/index.js'
 import type { OrezDataWorkerEnv } from '../src/cf-do/lite-data-worker.js'
 import type { Schema } from '@rocicorp/zero'
 

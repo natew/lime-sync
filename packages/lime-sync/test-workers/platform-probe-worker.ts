@@ -4,7 +4,7 @@ import {
   SqlStorageDirect,
   SqlStorageMutatorTransaction,
   SqlStorageSyncDb,
-} from '../../sync-cf-host/src/sql-storage-adapter.js'
+} from '../../lime-sync-cf-host/src/sql-storage-adapter.js'
 import {
   canonical_pk_probe,
   init_probe_schema,
@@ -13,15 +13,15 @@ import {
   push_preflight,
   rust_panic_after_writes,
   value_round_trip,
-} from '../../sync-cf-host/src/wasm-platform.js'
+} from '../../lime-sync-cf-host/src/wasm-platform.js'
 import {
   engine_handle_query_pull,
   engine_init_query_schema,
   engine_init_schema,
-} from '../../sync-cf-host/src/wasm.js'
+} from '../../lime-sync-cf-host/src/wasm.js'
 import { createApplicationSqlClient, ZeroDO } from '../src/cf-do/worker.js'
 
-import type { SqlStorageFailure } from '../../sync-cf-host/src/sql-storage-adapter.js'
+import type { SqlStorageFailure } from '../../lime-sync-cf-host/src/sql-storage-adapter.js'
 import type { TransactionQueryFormat, ZeroSchemaConfig } from 'lime-sync-executor'
 
 interface Env {
