@@ -6,7 +6,7 @@ rather not run Postgres and a long-lived cache process. On Cloudflare it runs
 as one Durable Object per namespace, holding both the sync engine and its SQLite
 storage in the same object.
 
-The client half of Zero is unchanged. `lime-sync/client` supplies the browser
+The client half of Zero is unchanged. `@o/lime-sync/client` supplies the browser
 transport without forking Zero's API. What this replaces is the server half:
 replicating upstream data, feeding row changes to clients, running custom
 mutators, tracking per-client last-mutation-ids, and serving per-query
@@ -60,17 +60,17 @@ state is a last-mutation-id and the client-group to user binding.
 
 ## Where the code lives
 
-| Path                                         | What it is                                                              |
-| -------------------------------------------- | ----------------------------------------------------------------------- |
-| `crates/sync-core`                           | The deterministic Rust sync engine.                                     |
-| `crates/sync-wasm`                           | The `wasm-bindgen` wrapper that compiles the engine for the DO host.    |
-| `crates/sync-native`                         | A standalone axum host for the same engine.                             |
-| `packages/lime-sync-cf-host`                 | The Cloudflare Durable Object host, published as `lime-sync-cf-host`.   |
-| `packages/lime-sync-browser-host`            | The Bedrock and IndexedDB browser worker host, exported by `lime-sync`. |
-| `packages/lime-sync-executor`                | Shared mutation transactions, CRUD, replay, and effect execution.       |
-| `packages/lime-sync/src/client/transport.ts` | The stock Zero browser transport for Orez pull, push, and wake.         |
-| `packages/lime-sync/src/cf-do/worker.ts`     | The data worker that owns writes and serves the change feed.            |
-| `harness/`                                   | The conformance and qualification test harness.                         |
+| Path                                         | What it is                                                                 |
+| -------------------------------------------- | -------------------------------------------------------------------------- |
+| `crates/sync-core`                           | The deterministic Rust sync engine.                                        |
+| `crates/sync-wasm`                           | The `wasm-bindgen` wrapper that compiles the engine for the DO host.       |
+| `crates/sync-native`                         | A standalone axum host for the same engine.                                |
+| `packages/lime-sync-cf-host`                 | The Cloudflare Durable Object host, published as `@o/lime-sync-cf-host`.   |
+| `packages/lime-sync-browser-host`            | The Bedrock and IndexedDB browser worker host, exported by `@o/lime-sync`. |
+| `packages/lime-sync-executor`                | Shared mutation transactions, CRUD, replay, and effect execution.          |
+| `packages/lime-sync/src/client/transport.ts` | The stock Zero browser transport for Orez pull, push, and wake.            |
+| `packages/lime-sync/src/cf-do/worker.ts`     | The data worker that owns writes and serves the change feed.               |
+| `harness/`                                   | The conformance and qualification test harness.                            |
 
 The broader orez project is a local Zero development stack (run Zero on PGlite or
 embedded Postgres with no native dependencies, see the repository README). The

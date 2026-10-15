@@ -1,19 +1,19 @@
-import { executeTransactionQueryPlan } from 'lime-sync-cf-host/transaction-query'
-import { encodeSqlValue } from 'lime-sync-executor/sqlite'
+import { executeTransactionQueryPlan } from '@o/lime-sync-cf-host/transaction-query'
+import { encodeSqlValue } from '@o/lime-sync-executor/sqlite'
 
 import type { SyncSql } from './types.js'
-import type { BedrockSqliteModule, Database, Statement } from 'bedrock-sqlite/browser'
 import type {
   CompiledTransactionQueryPlan,
   TransactionQueryBudget,
-} from 'lime-sync-cf-host/transaction-query'
-import type { TransactionQueryFormat } from 'lime-sync-executor'
+} from '@o/lime-sync-cf-host/transaction-query'
+import type { TransactionQueryFormat } from '@o/lime-sync-executor'
 import type {
   ApplicationTransaction,
   ExecResult as SQLiteExecResult,
   SqlStatementMetadata,
-} from 'lime-sync-executor'
-import type { SqlWireValue } from 'lime-sync-executor/sqlite'
+} from '@o/lime-sync-executor'
+import type { SqlWireValue } from '@o/lime-sync-executor/sqlite'
+import type { BedrockSqliteModule, Database, Statement } from 'bedrock-sqlite/browser'
 
 export type WireValue = SqlWireValue
 

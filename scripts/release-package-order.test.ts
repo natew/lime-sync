@@ -18,15 +18,15 @@ describe('orderReleasePackages', () => {
     const packages = [
       pkg('orez', {
         'bedrock-sqlite': 'workspace:*',
-        'lime-sync-cf-host': 'workspace:*',
+        '@o/lime-sync-cf-host': 'workspace:*',
       }),
       pkg('bedrock-sqlite'),
-      pkg('lime-sync-cf-host'),
+      pkg('@o/lime-sync-cf-host'),
     ]
 
     expect(orderReleasePackages(packages).map((item) => item.pkg.name)).toEqual([
       'bedrock-sqlite',
-      'lime-sync-cf-host',
+      '@o/lime-sync-cf-host',
       'orez',
     ])
   })
@@ -42,27 +42,27 @@ describe('orderReleasePackages', () => {
 
   it('adds a missing local dependency required by an installed package', () => {
     const packages = [
-      pkg('orez', { 'lime-sync-cf-host': 'workspace:*' }),
-      pkg('lime-sync-cf-host'),
+      pkg('orez', { '@o/lime-sync-cf-host': 'workspace:*' }),
+      pkg('@o/lime-sync-cf-host'),
       pkg('unrelated'),
     ]
 
     expect(
       selectLocalReleasePackages(packages, new Set(['orez'])).map((item) => item.pkg.name)
-    ).toEqual(['lime-sync-cf-host', 'orez'])
+    ).toEqual(['@o/lime-sync-cf-host', 'orez'])
   })
 
   it('orders optional platform packages before their launcher', () => {
     const packages = [
-      optionalPkg('lime-sync-native', {
-        'lime-sync-native-darwin-arm64': 'workspace:*',
+      optionalPkg('@o/lime-sync-native', {
+        '@o/lime-sync-native-darwin-arm64': 'workspace:*',
       }),
-      optionalPkg('lime-sync-native-darwin-arm64'),
+      optionalPkg('@o/lime-sync-native-darwin-arm64'),
     ]
 
     expect(orderReleasePackages(packages).map((item) => item.pkg.name)).toEqual([
-      'lime-sync-native-darwin-arm64',
-      'lime-sync-native',
+      '@o/lime-sync-native-darwin-arm64',
+      '@o/lime-sync-native',
     ])
   })
 })

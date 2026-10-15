@@ -1,1 +1,1 @@
-export * from 'lime-sync-cf-host/bun-wasm-loader'
+export * from '@o/lime-sync-cf-host/bun-wasm-loader'

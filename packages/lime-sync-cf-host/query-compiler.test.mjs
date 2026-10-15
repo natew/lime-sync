@@ -1,8 +1,8 @@
 import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 
-import { createQueryCompiler } from 'lime-sync-cf-host/query-compiler'
-import { executeTransactionQueryPlan } from 'lime-sync-cf-host/transaction-query'
+import { createQueryCompiler } from '@o/lime-sync-cf-host/query-compiler'
+import { executeTransactionQueryPlan } from '@o/lime-sync-cf-host/transaction-query'
 
 const schema = {
   tables: {

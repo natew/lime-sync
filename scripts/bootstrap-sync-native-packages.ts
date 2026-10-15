@@ -72,9 +72,9 @@ function resolveTarget(): BootstrapTarget {
       confirmation: 'CLAIM LIME-SYNC FAMILY PACKAGES',
       errorLabel: 'family release files',
       packageNames: [
-        'lime-sync',
-        'lime-sync-executor',
-        'lime-sync-cf-host',
+        '@o/lime-sync',
+        '@o/lime-sync-executor',
+        '@o/lime-sync-cf-host',
         'bedrock-sqlite',
       ],
       preparePackages: prepareFamilyBootstrapPackages,
@@ -90,7 +90,7 @@ function resolveTarget(): BootstrapTarget {
       ],
       successMessage:
         'All four lime-sync family package names and trusted publishers are ready.',
-      validateName: (name) => !name.startsWith('@'),
+      validateName: (name) => name.startsWith('@o/') || name === 'bedrock-sqlite',
       workflow: 'release.yml',
       workspaceName: 'lime-sync-family-bootstrap-workspace',
     }
@@ -100,7 +100,7 @@ function resolveTarget(): BootstrapTarget {
   }
 
   const packageNames = [
-    'lime-sync-native',
+    '@o/lime-sync-native',
     ...SYNC_NATIVE_PLATFORMS.map(({ npmPackage }) => npmPackage),
   ]
   return {
@@ -118,7 +118,7 @@ function resolveTarget(): BootstrapTarget {
     ],
     successMessage:
       'All nine lime-sync native package names and trusted publishers are ready.',
-    validateName: (name) => !name.startsWith('@'),
+    validateName: (name) => name.startsWith('@o/'),
     workflow: 'release-sync-native.yml',
     workspaceName: 'lime-sync-native-bootstrap-workspace',
   }

@@ -24,16 +24,16 @@ push back to `main`. Stable release commits, whose subject matches the checked-i
 
 Configure the same GitHub Actions trusted publisher for each public package:
 
-- `lime-sync`
+- `@o/lime-sync`
 - `bedrock-sqlite`
-- `lime-sync-executor`
-- `lime-sync-cf-host`
-- `lime-sync-native` plus every `lime-sync-native-*` platform package
+- `@o/lime-sync-executor`
+- `@o/lime-sync-cf-host`
+- `@o/lime-sync-native` plus every `lime-sync-native-*` platform package
 
 Use these settings in each package's npm **Settings → Trusted publishing** page:
 
 - Organization or user: `natew`
-- Repository: `lime-sync`
+- Repository: `@o/lime-sync`
 - Workflow filename: `release.yml` (or `release-sync-native.yml` for the
   native launcher and platform packages)
 - Environment name: leave blank
@@ -90,7 +90,7 @@ publish the native prerequisite when needed and the workspace canary family.
 ## Local consumer validation
 
 To exercise the current source in the sibling Orez checkout (whose `on-zero`
-package consumes `lime-sync` from npm), run:
+package consumes `@o/lime-sync` from npm), run:
 
 ```sh
 bun release --into ~/orez

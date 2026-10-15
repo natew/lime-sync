@@ -1,1 +1,1 @@
-export * from 'lime-sync-cf-host/query-compiler'
+export * from '@o/lime-sync-cf-host/query-compiler'

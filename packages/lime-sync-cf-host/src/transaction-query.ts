@@ -1,4 +1,4 @@
-import type { TransactionQueryFormat } from 'lime-sync-executor'
+import type { TransactionQueryFormat } from '@o/lime-sync-executor'
 
 export type TransactionQueryWireValue =
   | { kind: 'null' }

@@ -1,7 +1,7 @@
 /**
  * Node-side Cloudflare build and deployment helpers.
  *
- * Application workers import `lime-sync/cloudflare`; build scripts import this
+ * Application workers import `@o/lime-sync/cloudflare`; build scripts import this
  * explicitly so workerd never inherits Node tooling and Node never evaluates
  * `cloudflare:workers`.
  */

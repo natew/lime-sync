@@ -1,12 +1,12 @@
 import type {
   CompiledTransactionQueryPlan,
   TransactionQueryBudget,
-} from 'lime-sync-cf-host/transaction-query'
+} from '@o/lime-sync-cf-host/transaction-query'
 import type {
   ExecResult,
   SqlStatementMetadata,
   TransactionQueryFormat,
-} from 'lime-sync-executor'
+} from '@o/lime-sync-executor'
 
 export type ApplicationSqlQueryCompiler = (
   ast: unknown,

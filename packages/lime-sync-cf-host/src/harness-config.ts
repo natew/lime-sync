@@ -3,8 +3,8 @@ import {
   MutationRetryError,
   registerMutators,
   type JsonValue,
-} from 'lime-sync-executor/core'
-import { defineStreamingFields } from 'lime-sync-executor/realtime'
+} from '@o/lime-sync-executor/core'
+import { defineStreamingFields } from '@o/lime-sync-executor/realtime'
 
 import { queries } from '../../../harness/src/query-resolver.mjs'
 import { harnessSchema, harnessStreaming } from './harness-schema.js'

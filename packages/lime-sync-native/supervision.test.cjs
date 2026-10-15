@@ -42,7 +42,7 @@ async function fixture(t, runtime = process.execPath) {
   const launcher = path.join(root, 'bin/sync-native.cjs')
   fs.cpSync(path.join(source, 'bin'), path.dirname(launcher), { recursive: true })
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ version: 'test' }))
-  const platform = `lime-sync-native-${process.platform}-${process.arch}${process.platform === 'linux' ? '-gnu' : ''}`
+  const platform = `@o/lime-sync-native-${process.platform}-${process.arch}${process.platform === 'linux' ? '-gnu' : ''}`
   const platformRoot = path.join(root, 'node_modules', platform)
   fs.mkdirSync(path.join(platformRoot, 'bin'), { recursive: true })
   fs.writeFileSync(

@@ -1,12 +1,12 @@
 import type { TransactionQueryBudget } from './transaction-query.js'
-import type { AnyQueryRegistry, Schema } from '@rocicorp/zero'
 import type {
   ExecResult,
   MutatorRegistry,
   NormalizedClaims,
   SqlStatementMetadata,
-} from 'lime-sync-executor'
-import type { StreamingManifest } from 'lime-sync-executor/realtime'
+} from '@o/lime-sync-executor'
+import type { StreamingManifest } from '@o/lime-sync-executor/realtime'
+import type { AnyQueryRegistry, Schema } from '@rocicorp/zero'
 
 export interface SyncSql {
   exec(

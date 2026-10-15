@@ -52,25 +52,25 @@ try {
       `import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 const expected = new Map([
-  ['lime-sync-cf-host', '/dist/index.js'],
-  ['lime-sync-cf-host/node-wasm-loader', '/dist/node-wasm-loader.js'],
-  ['lime-sync-cf-host/bun-wasm-loader', '/dist/bun-wasm-loader.js'],
-  ['lime-sync-cf-host/query-compiler', '/dist/query-compiler.js'],
-  ['lime-sync-cf-host/transaction-query', '/dist/transaction-query.js'],
-  ['lime-sync-cf-host/vite-wasm-loader', '/dist/vite-wasm-loader.js'],
+  ['@o/lime-sync-cf-host', '/dist/index.js'],
+  ['@o/lime-sync-cf-host/node-wasm-loader', '/dist/node-wasm-loader.js'],
+  ['@o/lime-sync-cf-host/bun-wasm-loader', '/dist/bun-wasm-loader.js'],
+  ['@o/lime-sync-cf-host/query-compiler', '/dist/query-compiler.js'],
+  ['@o/lime-sync-cf-host/transaction-query', '/dist/transaction-query.js'],
+  ['@o/lime-sync-cf-host/vite-wasm-loader', '/dist/vite-wasm-loader.js'],
 ])
 for (const [specifier, suffix] of expected) {
   const resolved = import.meta.resolve(specifier)
   if (!resolved.endsWith(suffix)) throw new Error(specifier + ' resolved to ' + resolved)
 }
-const wasm = import.meta.resolve('lime-sync-cf-host/wasm-module.wasm')
+const wasm = import.meta.resolve('@o/lime-sync-cf-host/wasm-module.wasm')
 if (!wasm.endsWith('/dist/generated/sync_wasm_bg.wasm')) throw new Error(wasm)
 if (!existsSync(fileURLToPath(wasm))) throw new Error('wasm export is missing')
-const transaction = await import('lime-sync-cf-host/transaction-query')
+const transaction = await import('@o/lime-sync-cf-host/transaction-query')
 if (typeof transaction.executeTransactionQueryPlan !== 'function') {
   throw new Error('built transaction-query export did not load')
 }
-const viteLoader = await import('lime-sync-cf-host/vite-wasm-loader')
+const viteLoader = await import('@o/lime-sync-cf-host/vite-wasm-loader')
 if (typeof viteLoader.orezSyncCfHostWasm !== 'function') {
   throw new Error('built Vite loader export did not load')
 }
@@ -85,10 +85,10 @@ if (typeof companion.__wbg_set_wasm !== 'function') {
   execFileSync(
     'node',
     [
-      '--import=lime-sync-cf-host/node-wasm-loader',
+      '--import=@o/lime-sync-cf-host/node-wasm-loader',
       '--input-type=module',
       '-e',
-      `const compiler = await import('lime-sync-cf-host/query-compiler')
+      `const compiler = await import('@o/lime-sync-cf-host/query-compiler')
 if (typeof compiler.createQueryCompiler !== 'function') {
   throw new Error('query compiler did not load through the Node Wasm loader')
 }`,

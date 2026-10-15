@@ -1,7 +1,7 @@
 import { engine_compile_query } from './wasm.js'
 
 import type { CompiledTransactionQueryPlan } from './transaction-query.js'
-import type { TransactionQueryFormat, ZeroSchemaConfig } from 'lime-sync-executor'
+import type { TransactionQueryFormat, ZeroSchemaConfig } from '@o/lime-sync-executor'
 
 export type TransactionQueryCompiler = (
   ast: unknown,

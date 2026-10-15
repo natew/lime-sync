@@ -1,7 +1,7 @@
 import type { BrowserHostTestHooks, BrowserHostTestFaultPoint } from './host.js'
 import type { BrowserSyncHost, BrowserSyncHostPortClient } from './types.js'
+import type { SqlStatementMetadata } from '@o/lime-sync-executor'
 import type { Schema } from '@rocicorp/zero'
-import type { SqlStatementMetadata } from 'lime-sync-executor'
 
 type SerializedRequest = {
   url: string

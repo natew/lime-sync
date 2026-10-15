@@ -17,7 +17,7 @@ import { resolve } from 'node:path'
 import { currentSyncNativePlatform, syncNativeVersion } from './sync-native-package.js'
 import { SYNC_NATIVE_PLATFORMS } from './sync-native-platforms.js'
 
-const launcherPackage = 'lime-sync-native'
+const launcherPackage = '@o/lime-sync-native'
 const root = resolve(import.meta.dirname, '..')
 const nativePackages = [
   launcherPackage,

@@ -10,7 +10,7 @@ import type {
   ApplicationSqlTransaction,
 } from './cf-do/application-sql.js'
 import type { TransactionQueryBudget } from './cloudflare-transaction-query.js'
-import type { TransactionQueryFormat } from 'lime-sync-executor'
+import type { TransactionQueryFormat } from '@o/lime-sync-executor'
 
 export type LocalApplicationSqlTransaction = Pick<
   ApplicationSqlTransaction,

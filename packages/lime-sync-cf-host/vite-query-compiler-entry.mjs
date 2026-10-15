@@ -1,4 +1,4 @@
-import { createQueryCompiler } from 'lime-sync-cf-host/query-compiler'
+import { createQueryCompiler } from '@o/lime-sync-cf-host/query-compiler'
 
 const compile = createQueryCompiler({
   tables: {

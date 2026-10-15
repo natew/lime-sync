@@ -1,5 +1,5 @@
 {
-  "name": "lime-sync",
+  "name": "@o/lime-sync",
   "version": "0.16.20",
   "description": "SQLite and Rust sync engine for Zero applications",
   "type": "module",
@@ -145,8 +145,8 @@
     "bedrock-sqlite": "workspace:*",
     "es-module-lexer": "1.7.0",
     "esbuild": "^0.25.0",
-    "lime-sync-cf-host": "workspace:*",
-    "lime-sync-executor": "workspace:*",
+    "@o/lime-sync-cf-host": "workspace:*",
+    "@o/lime-sync-executor": "workspace:*",
     "ws": "^8.19.0"
   },
   "peerDependencies": {
@@ -159,7 +159,7 @@
     }
   },
   "optionalDependencies": {
-    "lime-sync-native": "workspace:*"
+    "@o/lime-sync-native": "workspace:*"
   },
   "devDependencies": {
     "@rocicorp/zero": "1.9.0",

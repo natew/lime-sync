@@ -1,6 +1,6 @@
+import { MutationApplicationError } from '@o/lime-sync-executor/core'
+import { createBrowserSyncHost } from '@o/lime-sync/browser'
 import { createBuilder, defineQueries, defineQuery } from '@rocicorp/zero'
-import { MutationApplicationError } from 'lime-sync-executor/core'
-import { createBrowserSyncHost } from 'lime-sync/browser'
 
 import {
   createBrowserSyncHostInternal,
@@ -9,7 +9,7 @@ import {
 import { serveBrowserSyncHostPortInternal } from '../../src/message-port.js'
 
 import type { BrowserSyncHost, BrowserSyncHostConfig } from '../../src/types.js'
-import type { JsonValue, MutatorRegistry } from 'lime-sync-executor'
+import type { JsonValue, MutatorRegistry } from '@o/lime-sync-executor'
 
 const schema = {
   tables: {

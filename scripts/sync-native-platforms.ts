@@ -23,7 +23,7 @@ const platform = (
   id,
   target,
   runner,
-  npmPackage: `lime-sync-native-${id}`,
+  npmPackage: `@o/lime-sync-native-${id}`,
   packageDir: `packages/lime-sync-native-${id}`,
   os,
   cpu,
@@ -131,7 +131,7 @@ try {
   if (platformVersion !== launcherVersion) {
     console.error(
       \`sync-native binary package for \${key} is \${platformVersion}, expected \${launcherVersion}. \` +
-        'Reinstall lime-sync-native so its optional dependencies match.'
+        'Reinstall @o/lime-sync-native so its optional dependencies match.'
     )
     process.exit(1)
   }
@@ -139,7 +139,7 @@ try {
 } catch (error) {
   console.error(
     \`sync-native binary package for \${key} is missing. \` +
-      'Reinstall lime-sync-native without omitting optional dependencies.'
+      'Reinstall @o/lime-sync-native without omitting optional dependencies.'
   )
   process.exit(1)
 }

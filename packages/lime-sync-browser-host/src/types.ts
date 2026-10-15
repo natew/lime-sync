@@ -1,12 +1,12 @@
-import type { AnyQueryRegistry, Schema } from '@rocicorp/zero'
-import type { TransactionQueryBudget } from 'lime-sync-cf-host/transaction-query'
+import type { TransactionQueryBudget } from '@o/lime-sync-cf-host/transaction-query'
 import type {
   AuthData,
   ExecResult,
   MutatorRegistry,
   SqlStatementMetadata,
   SyncExecutor,
-} from 'lime-sync-executor'
+} from '@o/lime-sync-executor'
+import type { AnyQueryRegistry, Schema } from '@rocicorp/zero'
 
 export interface SyncSql {
   exec(

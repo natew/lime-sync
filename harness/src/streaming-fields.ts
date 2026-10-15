@@ -15,12 +15,12 @@
 
 import assert from 'node:assert/strict'
 
-import { createSocketProducer, encodeFrame } from 'lime-sync-executor/realtime'
+import { createSocketProducer, encodeFrame } from '@o/lime-sync-executor/realtime'
 
 import { harnessStreaming } from '../../packages/lime-sync-cf-host/src/harness-schema.js'
 import { queries } from './fixture.js'
 
-import type { RealtimeTopic } from 'lime-sync-executor/realtime'
+import type { RealtimeTopic } from '@o/lime-sync-executor/realtime'
 
 const args = process.argv.slice(2)
 const flag = (name: string): string | undefined => {

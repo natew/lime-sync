@@ -10,7 +10,7 @@
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
     "paths": {
-      "lime-sync/browser": ["packages/lime-sync/dist/browser/index.d.ts"]
+      "@o/lime-sync/browser": ["packages/lime-sync/dist/browser/index.d.ts"]
     }
   },
   "include": ["src/**/*.ts", "test/browser/main.ts", "test/browser/worker.ts"]

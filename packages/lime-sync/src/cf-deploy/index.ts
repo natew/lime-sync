@@ -1,5 +1,5 @@
 // App-neutral Orez Lite primitives. Public consumers import these through
-// `lime-sync/cloudflare`.
+// `@o/lime-sync/cloudflare`.
 export * from './bundle.js'
 export * from './config.js'
 export * from './leaves.js'

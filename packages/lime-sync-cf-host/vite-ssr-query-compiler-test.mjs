@@ -3,7 +3,7 @@ import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { orezSyncCfHostWasm } from 'lime-sync-cf-host/vite-wasm-loader'
+import { orezSyncCfHostWasm } from '@o/lime-sync-cf-host/vite-wasm-loader'
 import { build, createServer } from 'vite'
 
 const server = await createServer({
@@ -15,7 +15,7 @@ const server = await createServer({
 })
 
 try {
-  const module = await server.ssrLoadModule('lime-sync-cf-host/query-compiler')
+  const module = await server.ssrLoadModule('@o/lime-sync-cf-host/query-compiler')
   assert.equal(typeof module.createQueryCompiler, 'function')
 } finally {
   await server.close()

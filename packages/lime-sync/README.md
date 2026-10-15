@@ -1,18 +1,18 @@
 # lime-sync
 
-`lime-sync` is the SQLite and Rust sync engine for Zero applications.
+`@o/lime-sync` is the SQLite and Rust sync engine for Zero applications.
 
-- `lime-sync` provides the host-neutral mutation executor.
-- `lime-sync/client` connects a stock Zero client to the HTTP sync protocol.
-- `lime-sync/browser` runs the engine with SQLite WASM in a browser worker.
-- `lime-sync/native` runs the prebuilt native engine from an application-owned
+- `@o/lime-sync` provides the host-neutral mutation executor.
+- `@o/lime-sync/client` connects a stock Zero client to the HTTP sync protocol.
+- `@o/lime-sync/browser` runs the engine with SQLite WASM in a browser worker.
+- `@o/lime-sync/native` runs the prebuilt native engine from an application-owned
   Zero schema, SQLite initializer, and HTTP policy callbacks.
-- `lime-sync/local` prepares SQLite and owns the local native process.
-- `lime-sync/vite` starts the local host only while Vite is serving.
-- `lime-sync/aggregate` generates count and sum migrations and projects their
+- `@o/lime-sync/local` prepares SQLite and owns the local native process.
+- `@o/lime-sync/vite` starts the local host only while Vite is serving.
+- `@o/lime-sync/aggregate` generates count and sum migrations and projects their
   optimistic client updates.
-- `lime-sync/cloudflare` provides the Cloudflare runtime and data-worker factory.
-- `lime-sync/cloudflare/build` provides Node-side worker build and deployment tools.
+- `@o/lime-sync/cloudflare` provides the Cloudflare runtime and data-worker factory.
+- `@o/lime-sync/cloudflare/build` provides Node-side worker build and deployment tools.
 
 The package derives its database projection from the application’s Zero schema.
 Applications do not maintain separate table or column maps.
@@ -27,7 +27,7 @@ the bounded token refresh policy and access-denied surface.
 The native host is configured entirely by the application:
 
 ```ts
-import { createNativeHost } from 'lime-sync/native'
+import { createNativeHost } from '@o/lime-sync/native'
 
 const host = createNativeHost({
   schema,
@@ -61,10 +61,10 @@ Local dev checks the configured port before preparing SQLite. An occupied port
 fails immediately with its holder's PID and command (using `lsof` on Unix or
 `netstat` and `tasklist` on Windows); choose another port offset or stop the holder.
 
-Local application SQL uses the Node SQLite adapter from `lime-sync/local`:
+Local application SQL uses the Node SQLite adapter from `@o/lime-sync/local`:
 
 ```ts
-import { createLocalApplicationSqlClientFactory } from 'lime-sync/local'
+import { createLocalApplicationSqlClientFactory } from '@o/lime-sync/local'
 
 const clients = createLocalApplicationSqlClientFactory({
   dataDir: '.orez/application-sql',
@@ -92,7 +92,7 @@ Application development normally uses the higher-level local configuration:
 
 ```ts
 // lime-sync.config.ts
-import { defineLocalConfig } from 'lime-sync/local'
+import { defineLocalConfig } from '@o/lime-sync/local'
 
 export default defineLocalConfig({
   schema,
@@ -111,7 +111,7 @@ export default defineLocalConfig({
 
 ```ts
 // vite.config.ts
-import { orez } from 'lime-sync/vite'
+import { orez } from '@o/lime-sync/vite'
 
 export default {
   plugins: [orez()],

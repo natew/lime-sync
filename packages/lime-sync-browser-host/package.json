@@ -1,7 +1,7 @@
 {
   "name": "lime-sync-browser-host",
   "version": "0.5.16",
-  "description": "Internal orez browser sync host. Do not import directly: consumers use lime-sync/browser.",
+  "description": "Internal orez browser sync host. Do not import directly: consumers use @o/lime-sync/browser.",
   "private": true,
   "type": "module",
   "exports": {
@@ -18,8 +18,8 @@
   },
   "dependencies": {
     "bedrock-sqlite": "workspace:*",
-    "lime-sync-cf-host": "workspace:*",
-    "lime-sync-executor": "workspace:*"
+    "@o/lime-sync-cf-host": "workspace:*",
+    "@o/lime-sync-executor": "workspace:*"
   },
   "devDependencies": {
     "esbuild": "0.25.12",

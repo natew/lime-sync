@@ -1,7 +1,7 @@
 import { sha256 } from '@noble/hashes/sha2.js'
+import { defineStreamingFields } from '@o/lime-sync-executor/realtime'
 import { createBuilder, defineQueries, defineQuery } from '@rocicorp/zero'
 import { WorkerEntrypoint } from 'cloudflare:workers'
-import { defineStreamingFields } from 'lime-sync-executor/realtime'
 
 import {
   createSyncDurableObject,

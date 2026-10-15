@@ -9,36 +9,36 @@ const { assertPortAvailable } = require('./port-check.cjs')
 
 const PACKAGES = {
   'darwin-arm64': {
-    packageName: 'lime-sync-native-darwin-arm64',
-    binary: 'lime-sync-native-darwin-arm64/bin/sync-native',
+    packageName: '@o/lime-sync-native-darwin-arm64',
+    binary: '@o/lime-sync-native-darwin-arm64/bin/sync-native',
   },
   'darwin-x64': {
-    packageName: 'lime-sync-native-darwin-x64',
-    binary: 'lime-sync-native-darwin-x64/bin/sync-native',
+    packageName: '@o/lime-sync-native-darwin-x64',
+    binary: '@o/lime-sync-native-darwin-x64/bin/sync-native',
   },
   'linux-arm64-glibc': {
-    packageName: 'lime-sync-native-linux-arm64-gnu',
-    binary: 'lime-sync-native-linux-arm64-gnu/bin/sync-native',
+    packageName: '@o/lime-sync-native-linux-arm64-gnu',
+    binary: '@o/lime-sync-native-linux-arm64-gnu/bin/sync-native',
   },
   'linux-arm64-musl': {
-    packageName: 'lime-sync-native-linux-arm64-musl',
-    binary: 'lime-sync-native-linux-arm64-musl/bin/sync-native',
+    packageName: '@o/lime-sync-native-linux-arm64-musl',
+    binary: '@o/lime-sync-native-linux-arm64-musl/bin/sync-native',
   },
   'linux-x64-glibc': {
-    packageName: 'lime-sync-native-linux-x64-gnu',
-    binary: 'lime-sync-native-linux-x64-gnu/bin/sync-native',
+    packageName: '@o/lime-sync-native-linux-x64-gnu',
+    binary: '@o/lime-sync-native-linux-x64-gnu/bin/sync-native',
   },
   'linux-x64-musl': {
-    packageName: 'lime-sync-native-linux-x64-musl',
-    binary: 'lime-sync-native-linux-x64-musl/bin/sync-native',
+    packageName: '@o/lime-sync-native-linux-x64-musl',
+    binary: '@o/lime-sync-native-linux-x64-musl/bin/sync-native',
   },
   'win32-arm64': {
-    packageName: 'lime-sync-native-win32-arm64',
-    binary: 'lime-sync-native-win32-arm64/bin/sync-native.exe',
+    packageName: '@o/lime-sync-native-win32-arm64',
+    binary: '@o/lime-sync-native-win32-arm64/bin/sync-native.exe',
   },
   'win32-x64': {
-    packageName: 'lime-sync-native-win32-x64',
-    binary: 'lime-sync-native-win32-x64/bin/sync-native.exe',
+    packageName: '@o/lime-sync-native-win32-x64',
+    binary: '@o/lime-sync-native-win32-x64/bin/sync-native.exe',
   },
 }
 
@@ -64,7 +64,7 @@ try {
   if (platformVersion !== launcherVersion) {
     console.error(
       `sync-native binary package for ${key} is ${platformVersion}, expected ${launcherVersion}. ` +
-        'Reinstall lime-sync-native so its optional dependencies match.'
+        'Reinstall @o/lime-sync-native so its optional dependencies match.'
     )
     process.exit(1)
   }
@@ -72,7 +72,7 @@ try {
 } catch (error) {
   console.error(
     `sync-native binary package for ${key} is missing. ` +
-      'Reinstall lime-sync-native without omitting optional dependencies.'
+      'Reinstall @o/lime-sync-native without omitting optional dependencies.'
   )
   process.exit(1)
 }

@@ -1,4 +1,4 @@
-import wasmModule from 'lime-sync-cf-host/wasm-module.wasm'
+import wasmModule from '@o/lime-sync-cf-host/wasm-module.wasm'
 
 import * as generated from './generated/sync_wasm.js'
 
@@ -8,7 +8,7 @@ function ensureWasm(): void {
   if (initialized) return
   if (!(wasmModule instanceof WebAssembly.Module)) {
     throw new TypeError(
-      '.wasm import did not resolve to WebAssembly.Module; see the lime-sync-cf-host README Query compiler runtimes matrix'
+      '.wasm import did not resolve to WebAssembly.Module; see the @o/lime-sync-cf-host README Query compiler runtimes matrix'
     )
   }
   generated.initSync({ module: wasmModule })

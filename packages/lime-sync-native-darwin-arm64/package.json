@@ -1,5 +1,5 @@
 {
-  "name": "lime-sync-native-darwin-arm64",
+  "name": "@o/lime-sync-native-darwin-arm64",
   "version": "0.1.6",
   "description": "Prebuilt Orez sync-native host for macOS ARM64",
   "license": "MIT",

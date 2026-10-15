@@ -36,7 +36,7 @@ export interface NativeHost {
 const load = createRequire(import.meta.url)
 
 export async function assertNativeHostPortAvailable(port: number, host?: string) {
-  const { assertPortAvailable } = load('lime-sync-native/port-check')
+  const { assertPortAvailable } = load('@o/lime-sync-native/port-check')
   await assertPortAvailable(port, host)
 }
 
@@ -51,7 +51,7 @@ export function createNativeHost(options: NativeHostOptions): NativeHost {
       try {
         writeJson(schemaPath, options.schema)
         writeJson(initSqlPath, options.initSql)
-        const launcher = load.resolve('lime-sync-native/launcher')
+        const launcher = load.resolve('@o/lime-sync-native/launcher')
         const child = spawn(
           process.execPath,
           [launcher, ...nativeHostArguments(options, schemaPath, initSqlPath)],

@@ -5,7 +5,7 @@ engine. The package exposes a consumer integration surface (`createSyncWorker`,
 `createSyncDurableObject`) and a harness deployment built
 from `src/harness-worker.ts`. Consumers provide a JSON Zero schema, application
 DDL/seed initializer, normalized-claims authenticator, an
-`lime-sync-executor` mutator registry or delegated push route, and the app's
+`@o/lime-sync-executor` mutator registry or delegated push route, and the app's
 ordinary Zero `defineQueries` registry.
 
 The Worker authenticates and authorizes at the consumer edge, then forwards
@@ -13,7 +13,7 @@ normalized claims inside the binding request body, where request-header
 observability cannot record them. It never logs tokens, mutation arguments, or
 row contents. Pull runs `engine_handle_query_pull` inside `transactionSync`;
 local push delegates validation, replay, LMID advancement, CRUD, and committed
-effects to `lime-sync-executor` inside `ctx.storage.transaction`. Every SQL
+effects to `@o/lime-sync-executor` inside `ctx.storage.transaction`. Every SQL
 cursor is materialized before an await. Mutators may await only their
 application transaction operations; timers, fetches, and other external work
 belong in
@@ -42,19 +42,19 @@ non-ASCII case pairs can diverge from PostgreSQL.
 
 ### Query compiler runtimes
 
-Every runtime uses the same `lime-sync-cf-host/wasm-module.wasm` import and the same
+Every runtime uses the same `@o/lime-sync-cf-host/wasm-module.wasm` import and the same
 `initSync` path. Configure the loader that matches the host:
 
 | Host                         | Configuration                                                                                                                                   | Module value                                                 |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
 | Workerd / Wrangler           | Map the package's `wasm-module.wasm` export as a compiled Wasm module                                                                           | Cloudflare `CompiledWasm`                                    |
 | Workerd build through Vite   | Add `orezSyncCfHostWasm({ runtime: 'workerd' })`, preload the Node or Bun loader during the build, and map the export as a compiled Wasm module | Cloudflare `CompiledWasm`                                    |
-| Bun                          | Preload `lime-sync-cf-host/bun-wasm-loader`                                                                                                     | `WebAssembly.Module` compiled by the Bun loader              |
-| Vite serve / SSR development | Add `orezSyncCfHostWasm()` from `lime-sync-cf-host/vite-wasm-loader`                                                                            | `WebAssembly.Module` built from package bytes by Vite        |
-| Direct Node >= 22.15         | Preload `lime-sync-cf-host/node-wasm-loader` with `NODE_OPTIONS=--import`                                                                       | `WebAssembly.Module` compiled by the Node loader             |
+| Bun                          | Preload `@o/lime-sync-cf-host/bun-wasm-loader`                                                                                                  | `WebAssembly.Module` compiled by the Bun loader              |
+| Vite serve / SSR development | Add `orezSyncCfHostWasm()` from `@o/lime-sync-cf-host/vite-wasm-loader`                                                                         | `WebAssembly.Module` built from package bytes by Vite        |
+| Direct Node >= 22.15         | Preload `@o/lime-sync-cf-host/node-wasm-loader` with `NODE_OPTIONS=--import`                                                                    | `WebAssembly.Module` compiled by the Node loader             |
 | Node production bundle       | Keep the same Vite plugin active for the production SSR build                                                                                   | `WebAssembly.Module` built from bytes embedded in the bundle |
 
-The Vite plugin also keeps `lime-sync-cf-host` inside Vite's SSR pipeline.
+The Vite plugin also keeps `@o/lime-sync-cf-host` inside Vite's SSR pipeline.
 
 Wrangler consumers map the bare address rather than a filesystem glob. The
 `.wasm` suffix is part of the public subpath because extension-keyed bundlers
@@ -63,7 +63,7 @@ classify the original import address:
 ```toml
 [[rules]]
 type = "CompiledWasm"
-globs = ["lime-sync-cf-host/wasm-module.wasm"]
+globs = ["@o/lime-sync-cf-host/wasm-module.wasm"]
 fallthrough = true
 ```
 
@@ -71,25 +71,25 @@ Bun consumers register the preload in `bunfig.toml`:
 
 ```toml
 # bunfig.toml
-preload = ["lime-sync-cf-host/bun-wasm-loader"]
+preload = ["@o/lime-sync-cf-host/bun-wasm-loader"]
 ```
 
 For a single command, use
-`bun --preload lime-sync-cf-host/bun-wasm-loader <command>`. The compiler throws
+`bun --preload @o/lime-sync-cf-host/bun-wasm-loader <command>`. The compiler throws
 an error pointing to this runtime matrix if a loader is missing.
 
 Direct Node consumers on Node 22.15 or newer preload the synchronous module
 hook. `NODE_OPTIONS` also carries the hook into test-runner child processes:
 
 ```sh
-NODE_OPTIONS=--import=lime-sync-cf-host/node-wasm-loader node app.js
+NODE_OPTIONS=--import=@o/lime-sync-cf-host/node-wasm-loader node app.js
 ```
 
 Node-targeted Vite consumers add the plugin once and leave it active in serve
 and build:
 
 ```ts
-import { orezSyncCfHostWasm } from 'lime-sync-cf-host/vite-wasm-loader'
+import { orezSyncCfHostWasm } from '@o/lime-sync-cf-host/vite-wasm-loader'
 
 export default {
   plugins: [orezSyncCfHostWasm()],
@@ -151,7 +151,7 @@ transports. Switching between custom minting, auth-token wake and disabled wake,
 or changing transport routing or timing, remains a configuration conflict.
 
 ```ts
-import { ensureHttpPullTransport } from 'lime-sync/client'
+import { ensureHttpPullTransport } from '@o/lime-sync/client'
 
 ensureHttpPullTransport({
   origin: syncOrigin,

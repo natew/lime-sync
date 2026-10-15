@@ -1,1 +1,1 @@
-export * from 'lime-sync-cf-host/transaction-query'
+export * from '@o/lime-sync-cf-host/transaction-query'

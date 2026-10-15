@@ -74,7 +74,7 @@ The composition worker (`rust-sync/chat-host/src/worker.ts`) exports
 `createSyncWorker(chatConfig)` in an origin-restricted CORS layer that passes
 WebSocket upgrades through untouched. Staging and production use dedicated host
 workers and dedicated `APP`/`DATA` targets, and Chat imports the published
-`lime-sync-cf-host` package.
+`@o/lime-sync-cf-host` package.
 
 Chat is live on this delegated design. The staging record (chat's
 `plans/cf-orez-migration-run.md`) verifies a fresh control snapshot, fresh
@@ -216,7 +216,7 @@ layer (handle preflight, echo headers, pass 101 upgrades through).
 - For delegated push, a second `[[services]]` `DATA` binding for the change
   feed, matching `upstream.binding`.
 - Vars for the app origin and any admin or test flags. Import the published
-  `lime-sync-cf-host` (as Chat and Contrast do); aliasing the bare import to the orez
+  `@o/lime-sync-cf-host` (as Chat and Contrast do); aliasing the bare import to the orez
   source is only for local orez development.
 
 ### 4. App-worker endpoints

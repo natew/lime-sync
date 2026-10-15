@@ -150,18 +150,18 @@ jobs:
             .release/launcher \
             --pack-destination .release/packed \
             --silent
-          if npm view "lime-sync-native@$version" version --json >/dev/null 2>&1; then
-            published_commit="$(npm view "lime-sync-native@$version" orezSourceCommit)"
+          if npm view "@o/lime-sync-native@$version" version --json >/dev/null 2>&1; then
+            published_commit="$(npm view "@o/lime-sync-native@$version" orezSourceCommit)"
             if [ "$published_commit" != '${{ github.sha }}' ]; then
-              echo "lime-sync-native@$version came from $published_commit, not ${{ github.sha }}" >&2
+              echo "@o/lime-sync-native@$version came from $published_commit, not ${{ github.sha }}" >&2
               exit 1
             fi
-            published_revision="$(npm view "lime-sync-native@$version" orezNativeSourceRevision)"
+            published_revision="$(npm view "@o/lime-sync-native@$version" orezNativeSourceRevision)"
             if [ "$published_revision" != '${{ needs.plan.outputs.source_revision }}' ]; then
-              echo "lime-sync-native@$version carries native source $published_revision, not ${{ needs.plan.outputs.source_revision }}" >&2
+              echo "@o/lime-sync-native@$version carries native source $published_revision, not ${{ needs.plan.outputs.source_revision }}" >&2
               exit 1
             fi
-            echo "lime-sync-native@$version already has this source commit"
+            echo "@o/lime-sync-native@$version already has this source commit"
           else
             npm publish .release/launcher --ignore-scripts --access public
           fi

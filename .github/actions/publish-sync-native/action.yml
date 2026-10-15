@@ -34,7 +34,7 @@ runs:
         # version records directly and install their verified tarballs.
         package_name="$(node -p "require('./.release/platform/package.json').name")"
         platform_url="https://registry.npmjs.org/$package_name/${{ inputs.version }}"
-        launcher_url="https://registry.npmjs.org/lime-sync-native/${{ inputs.version }}"
+        launcher_url="https://registry.npmjs.org/@o/lime-sync-native/${{ inputs.version }}"
         platform_tarball=''
         launcher_tarball=''
         attempt=0
@@ -60,7 +60,7 @@ runs:
           sleep 5
         done
         if [ -z "$platform_tarball" ] || [ -z "$launcher_tarball" ]; then
-          echo "lime-sync-native@${{ inputs.version }} or $package_name@${{ inputs.version }} has not reached the registry in five minutes" >&2
+          echo "@o/lime-sync-native@${{ inputs.version }} or $package_name@${{ inputs.version }} has not reached the registry in five minutes" >&2
           exit 1
         fi
         # installing the target explicitly exercises the launcher without

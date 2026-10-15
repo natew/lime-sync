@@ -1,6 +1,6 @@
 # Native npm releases
 
-`lime-sync-native` ships the generic standalone `sync-native` host through npm
+`@o/lime-sync-native` ships the generic standalone `sync-native` host through npm
 without a `postinstall` script. Applications keep authentication, named-query
 policy, migrations, and pushes in their JavaScript server. The Rust process owns
 SQLite replicas, pull, change tracking, and wake delivery.
@@ -20,7 +20,7 @@ whether the package was built from the current native implementation.
 
 ## Standalone contract
 
-Applications normally use `createNativeHost` from `lime-sync/native`. It accepts
+Applications normally use `createNativeHost` from `@o/lime-sync/native`. It accepts
 the Zero schema, initialization SQL, callback URLs, storage directory, and
 server options as one object, then resolves the correct prebuilt binary
 internally. The lower-level launcher remains available for non-JavaScript
@@ -107,7 +107,7 @@ boundary must opt in visibly with `into_router_trusted()`.
 
 Namespace file retention is disabled by default. Supervisors may opt into
 closing idle workers, without deleting their files, with `--retention workers`,
-`--worker-idle-ms`, and `--worker-sweep-ms`. The `lime-sync/native` equivalent
+`--worker-idle-ms`, and `--worker-sweep-ms`. The `@o/lime-sync/native` equivalent
 is `workerRetention`.
 
 ## Supported targets
@@ -159,7 +159,7 @@ The workflow can also be dispatched directly for an emergency native-only
 release. Either entry point requires current `main` and green CI for that exact
 commit.
 
-1. The small `lime-sync-native` launcher publishes first. Its optional
+1. The small `@o/lime-sync-native` launcher publishes first. Its optional
    dependencies point at the exact dynamically allocated platform package
    version. npm permits missing optional dependencies, so the launcher can
    exist while the native matrix is still building.
@@ -168,7 +168,7 @@ commit.
    point it is immediately usable, while every other target keeps building:
 
    ```sh
-   npm install lime-sync-native@<native-version>
+   npm install @o/lime-sync-native@<native-version>
    npx sync-native --version
    ```
 

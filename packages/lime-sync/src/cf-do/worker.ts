@@ -1,11 +1,11 @@
 // @ts-nocheck — cloudflare:workers types not available in orez
-import { DurableObject, RpcTarget } from 'cloudflare:workers'
 import {
   executeTransactionQueryPlan,
   type CompiledTransactionQueryPlan,
   type TransactionQueryBudget,
-} from 'lime-sync-cf-host/transaction-query'
-import { trackBillableCursorRows } from 'lime-sync-executor/sql-billing'
+} from '@o/lime-sync-cf-host/transaction-query'
+import { trackBillableCursorRows } from '@o/lime-sync-executor/sql-billing'
+import { DurableObject, RpcTarget } from 'cloudflare:workers'
 
 import {
   classifySql,
@@ -69,7 +69,7 @@ import type {
   ApplicationSqlTable,
   ApplicationSqlTransactionWork,
 } from './application-sql.js'
-import type { SqlStatementMetadata, TransactionQueryFormat } from 'lime-sync-executor'
+import type { SqlStatementMetadata, TransactionQueryFormat } from '@o/lime-sync-executor'
 
 export {
   ApplicationSqlSessionPreemptedError,
@@ -91,7 +91,7 @@ export type {
   ApplicationSqlTransaction,
   ApplicationSqlTransactionWork,
 } from './application-sql.js'
-export type { SqlStatementMetadata } from 'lime-sync-executor'
+export type { SqlStatementMetadata } from '@o/lime-sync-executor'
 
 /**
  * SQLite Durable Object used by Orez Lite.

@@ -228,7 +228,7 @@ Every route is under `/<namespace>/admin/` and gated by `authorizeAdmin` (or the
 
 ## Node host surface
 
-`lime-sync/native` exports `createNativeHost`, the supported Node and bun
+`@o/lime-sync/native` exports `createNativeHost`, the supported Node and bun
 integration. It launches the prebuilt Rust host with the application's Zero
 schema, SQLite initialization statements, storage directory, browser-origin
 policy, and HTTP callbacks.
@@ -239,7 +239,7 @@ authoritative SQLite file, starts the native child, waits for readiness, and
 owns shutdown:
 
 ```ts
-import { defineLocalConfig } from 'lime-sync/local'
+import { defineLocalConfig } from '@o/lime-sync/local'
 
 export default defineLocalConfig({
   schema,
@@ -256,9 +256,9 @@ export default defineLocalConfig({
 })
 ```
 
-`lime-sync/vite` runs this configuration only during local serve and proxies
+`@o/lime-sync/vite` runs this configuration only during local serve and proxies
 `/zero-http` to the configured namespace. Cloudflare builds continue to use
-`lime-sync/cloudflare/sync`. Non-Vite servers use the same implementation with
+`@o/lime-sync/cloudflare/sync`. Non-Vite servers use the same implementation with
 `lime-sync dev -- <server command>`.
 
 Every pull is query-driven. The application must define its named queries once
@@ -270,7 +270,7 @@ application rows.
 
 ```ts
 import { defineQueries, defineQuery } from '@rocicorp/zero'
-import { createNativeHost } from 'lime-sync/native'
+import { createNativeHost } from '@o/lime-sync/native'
 import { zql } from './zero.generated'
 
 export const appQueries = defineQueries({
@@ -336,7 +336,7 @@ Originless native and server-side sync clients remain supported.
 The standalone `sync-native serve` command requires
 `--admin-token-env <variable>`, plus a repeatable
 `--allow-origin <origin>`. The credential stays in the named environment
-variable and never appears in the process command line. `lime-sync/native`
+variable and never appears in the process command line. `@o/lime-sync/native`
 provides this contract through `createNativeHost`.
 
 ### Settling application-owned native pushes

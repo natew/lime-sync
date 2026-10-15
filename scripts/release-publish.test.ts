@@ -33,12 +33,12 @@ test('a zero-exit queued npm publish cannot report a completed release', async (
     )
     writeFileSync(
       join(root, 'packages/lime-sync-native/package.json'),
-      JSON.stringify({ name: 'lime-sync-native', version: '0.1.18' })
+      JSON.stringify({ name: '@o/lime-sync-native', version: '0.1.18' })
     )
     mkdirSync(join(root, 'packages/lime-sync'), { recursive: true })
     writeFileSync(
       join(root, 'packages/lime-sync/package.json'),
-      JSON.stringify({ name: 'lime-sync', version: '0.1.18' })
+      JSON.stringify({ name: '@o/lime-sync', version: '0.1.18' })
     )
     mkdirSync(join(root, 'bin'))
     writeFileSync(
@@ -92,7 +92,7 @@ globalThis.fetch = async () => new Response('not yet published', { status: 404 }
     expect(stdout).toContain('Your package is being processed')
     expect(exit).not.toBe(0)
     expect(stdout).not.toContain('released (canary):')
-    expect(stderr).toContain('lime-sync@0.1.18')
+    expect(stderr).toContain('@o/lime-sync@0.1.18')
     expect(stderr).toContain('not available')
   } finally {
     rmSync(root, { recursive: true, force: true })

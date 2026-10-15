@@ -1,6 +1,6 @@
+import { resolveQueryPatch } from '@o/lime-sync-cf-host/query-patch'
+import { beginWriteSetCapture, createSyncExecutor } from '@o/lime-sync-executor/core'
 import createSqliteModule from 'bedrock-sqlite/browser'
-import { resolveQueryPatch } from 'lime-sync-cf-host/query-patch'
-import { beginWriteSetCapture, createSyncExecutor } from 'lime-sync-executor/core'
 
 import {
   engine_compile_query,
@@ -27,7 +27,6 @@ import type {
   BrowserSyncHostOperation,
   BrowserSyncHostTransaction,
 } from './types.js'
-import type { Schema } from '@rocicorp/zero'
 import type {
   ApplicationDatabase,
   ApplicationTransaction,
@@ -38,7 +37,8 @@ import type {
   PushResult,
   SqlStatementMetadata,
   SyncExecutor,
-} from 'lime-sync-executor'
+} from '@o/lime-sync-executor'
+import type { Schema } from '@rocicorp/zero'
 
 export type BrowserHostTestFaultPoint =
   | 'before_mutation'

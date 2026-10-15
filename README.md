@@ -11,25 +11,25 @@ sync engine and its SQLite storage in the same object.
 Docs: https://lime-sync.natewienert.workers.dev
 
 ```sh
-bun add lime-sync
+bun add @o/lime-sync
 ```
 
 ```ts
-import { createClient } from 'lime-sync/client'
+import { createClient } from '@o/lime-sync/client'
 ```
 
 ## Packages
 
-| Package                           | npm                  | Purpose                                                           |
-| --------------------------------- | -------------------- | ----------------------------------------------------------------- |
-| `packages/lime-sync`              | `lime-sync`          | Public engine: client, browser, native, and Cloudflare surfaces   |
-| `packages/lime-sync-executor`     | `lime-sync-executor` | Host-neutral mutation execution and application adapters          |
-| `packages/lime-sync-cf-host`      | `lime-sync-cf-host`  | Cloudflare Durable Object host and query runtime                  |
-| `packages/lime-sync-browser-host` | private              | Browser worker host behind `lime-sync/browser`                    |
-| `packages/lime-sync-native`       | `lime-sync-native`   | Prebuilt native host launcher plus per-platform packages          |
-| `sqlite-wasm`                     | `bedrock-sqlite`     | WASM SQLite build with a better-sqlite3 compatible API            |
-| `crates/sync-core`                | —                    | Rust engine core, shared by native, WASM, and Cloudflare hosts    |
-| `harness`                         | private              | Conformance, fault, and differential suites that prove the engine |
+| Package                           | npm                     | Purpose                                                           |
+| --------------------------------- | ----------------------- | ----------------------------------------------------------------- |
+| `packages/lime-sync`              | `@o/lime-sync`          | Public engine: client, browser, native, and Cloudflare surfaces   |
+| `packages/lime-sync-executor`     | `@o/lime-sync-executor` | Host-neutral mutation execution and application adapters          |
+| `packages/lime-sync-cf-host`      | `@o/lime-sync-cf-host`  | Cloudflare Durable Object host and query runtime                  |
+| `packages/lime-sync-browser-host` | private                 | Browser worker host behind `@o/lime-sync/browser`                 |
+| `packages/lime-sync-native`       | `@o/lime-sync-native`   | Prebuilt native host launcher plus per-platform packages          |
+| `sqlite-wasm`                     | `bedrock-sqlite`        | WASM SQLite build with a better-sqlite3 compatible API            |
+| `crates/sync-core`                | —                       | Rust engine core, shared by native, WASM, and Cloudflare hosts    |
+| `harness`                         | private                 | Conformance, fault, and differential suites that prove the engine |
 
 `docs/sync` holds the architecture, configuration, testing, and operations
 guides. Cloudflare billing is a first-class constraint here: every change on a

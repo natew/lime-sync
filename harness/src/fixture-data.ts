@@ -1,5 +1,5 @@
 // storage fixture shared by the native and cloudflare rust harness hosts.
-import { MutationApplicationError } from 'lime-sync-executor'
+import { MutationApplicationError } from '@o/lime-sync-executor'
 
 import { validateAtomicAppendArgs } from './consistency/atomic-visibility-workload.js'
 import { validateIncrementProbeArgs } from './consistency/exactly-once-workload.js'

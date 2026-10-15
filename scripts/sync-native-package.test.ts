@@ -47,7 +47,7 @@ describe('sync-native npm packages', () => {
       ...platform.npmPackage.split('/')
     )
     preparePlatformPackage(platform.id, fakeBinary, platformDir)
-    const launcherDir = resolve(temporary, 'node_modules/lime-sync-native')
+    const launcherDir = resolve(temporary, 'node_modules/@o/lime-sync-native')
     prepareLauncherPackage(launcherDir)
 
     const shim = resolve(launcherDir, 'bin/sync-native.cjs')
@@ -137,7 +137,7 @@ describe('sync-native npm packages', () => {
       ...platform.npmPackage.split('/')
     )
     preparePlatformPackage(platform.id, fakeBinary, platformDir)
-    const launcherDir = resolve(temporary, 'node_modules/lime-sync-native')
+    const launcherDir = resolve(temporary, 'node_modules/@o/lime-sync-native')
     prepareLauncherPackage(launcherDir)
 
     const shim = resolve(launcherDir, 'bin/sync-native.cjs')

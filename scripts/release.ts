@@ -398,9 +398,9 @@ if (into) {
       } else if (item.name === 'bedrock-sqlite') {
         run('make -B dist/package.json', { cwd: item.dir })
       } else if (!skipBuild) {
-        if (item.name === 'lime-sync-cf-host') {
+        if (item.name === '@o/lime-sync-cf-host') {
           run('bun run build:wasm && bun run build:runtime', { cwd: item.dir })
-        } else if (item.name === 'lime-sync') {
+        } else if (item.name === '@o/lime-sync') {
           run(
             'bun run build:runtime && bun run --cwd ../lime-sync-browser-host build:runtime',
             { cwd: item.dir }
@@ -567,7 +567,7 @@ if (packOnly && !patch && !minor && !major && !canary) {
 // version map for resolving workspace:* at publish time
 const versionMap = new Map(packages.map((p) => [p.pkg.name, p.next]))
 if (canary && !rePublish && !packOnly && !dryRun) {
-  const response = await fetch('https://registry.npmjs.org/lime-sync/canary')
+  const response = await fetch('https://registry.npmjs.org/@o/lime-sync/canary')
   if (response.ok) {
     const metadata = (await response.json()) as { releaseSourceCommit?: string }
     const sourceCommit =
@@ -591,7 +591,7 @@ if (canary && !rePublish && !packOnly && !dryRun && !nativeReleaseVersion) {
       'npm',
       [
         'view',
-        'lime-sync-native@latest',
+        '@o/lime-sync-native@latest',
         'version',
         'orezSourceCommit',
         'orezNativeSourceRevision',

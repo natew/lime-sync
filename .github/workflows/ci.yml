@@ -558,7 +558,7 @@ jobs:
       - name: harness install
         run: cd harness && bun install
 
-      # harness lanes import lime-sync-executor by package path, which resolves
+      # harness lanes import @o/lime-sync-executor by package path, which resolves
       # to dist. Bun reads the rest of the harness from TypeScript source, so
       # nothing else in these lanes needs a build and it is easy to assume this
       # one does not either.

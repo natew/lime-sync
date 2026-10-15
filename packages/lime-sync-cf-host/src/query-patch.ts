@@ -1,5 +1,5 @@
+import type { JsonValue } from '@o/lime-sync-executor'
 import type { AnyQueryRegistry } from '@rocicorp/zero'
-import type { JsonValue } from 'lime-sync-executor'
 
 // Zero separates registry path segments with '.' or '|' (its getValueAtPath).
 const NAME_SEPARATOR = /[.|]/

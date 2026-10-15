@@ -1,4 +1,4 @@
-import { orezSyncCfHostWasm as syncCfHostWasm } from 'lime-sync-cf-host/vite-wasm-loader'
+import { orezSyncCfHostWasm as syncCfHostWasm } from '@o/lime-sync-cf-host/vite-wasm-loader'
 
 type OrezSyncCfHostWasmOptions = {
   runtime?: 'node' | 'workerd'
@@ -6,5 +6,5 @@ type OrezSyncCfHostWasmOptions = {
 
 /** load Orez Lite and its sync engine into Vite's SSR bundle. */
 export function orezSyncCfHostWasm(options: OrezSyncCfHostWasmOptions = {}) {
-  return syncCfHostWasm({ noExternal: ['lime-sync'], runtime: options.runtime })
+  return syncCfHostWasm({ noExternal: ['@o/lime-sync'], runtime: options.runtime })
 }

@@ -1,6 +1,6 @@
+import { createSyncExecutor, isMutationRetryError } from '@o/lime-sync-executor/core'
+import { createSocketHost } from '@o/lime-sync-executor/realtime'
 import { DurableObject } from 'cloudflare:workers'
-import { createSyncExecutor, isMutationRetryError } from 'lime-sync-executor/core'
-import { createSocketHost } from 'lime-sync-executor/realtime'
 
 import { validateSyncHostConfig } from './config.js'
 import { createQueryCompiler } from './query-compiler.js'
@@ -51,20 +51,20 @@ import {
 } from './write-safeguards.js'
 
 import type { SyncHostConfig, SyncHostEnv } from './types.js'
-import type { Schema } from '@rocicorp/zero'
 import type {
   ApplicationDatabase,
   ApplicationTransaction,
   JsonValue,
   NormalizedClaims,
   SyncExecutor,
-} from 'lime-sync-executor'
+} from '@o/lime-sync-executor'
 import type {
   HostConnection,
   RealtimeIdentity,
   RealtimeSocketHost,
   RealtimeTopic,
-} from 'lime-sync-executor/realtime'
+} from '@o/lime-sync-executor/realtime'
+import type { Schema } from '@rocicorp/zero'
 
 const NAMESPACE_HEADER = 'x-lime-sync-namespace'
 const UPSTREAM_PATH_HEADER = 'x-lime-sync-upstream-path'

@@ -1,7 +1,7 @@
 {
-  "name": "lime-sync-cf-host",
+  "name": "@o/lime-sync-cf-host",
   "version": "0.16.20",
-  "description": "Internal orez Cloudflare sync host. Do not import directly: consumers use lime-sync/cloudflare/sync.",
+  "description": "Internal orez Cloudflare sync host. Do not import directly: consumers use @o/lime-sync/cloudflare/sync.",
   "type": "module",
   "exports": {
     ".": {
@@ -52,7 +52,7 @@
     "test:integration": "bun run build:dist && bun integration-test.mjs",
     "test:ingest": "bun run build:dist && bun ingest-test.mjs",
     "test:package": "bun run build:dist && node package-runtime-test.mjs",
-    "test:query-compiler": "bun run build:dist && bun test --preload lime-sync-cf-host/bun-wasm-loader query-compiler.test.mjs && node vite-ssr-query-compiler-test.mjs",
+    "test:query-compiler": "bun run build:dist && bun test --preload @o/lime-sync-cf-host/bun-wasm-loader query-compiler.test.mjs && node vite-ssr-query-compiler-test.mjs",
     "test:restart": "bun run build:dist && bun restart-test.mjs",
     "test:platform": "bun run build:dist:platform && bun platform-test.mjs",
     "typecheck": "bun run build:dist:platform && tsc --noEmit",
@@ -60,7 +60,7 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "lime-sync-executor": "workspace:*"
+    "@o/lime-sync-executor": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260617.1",

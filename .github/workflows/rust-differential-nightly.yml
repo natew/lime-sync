@@ -91,7 +91,7 @@ jobs:
 
       # the sweep imports lime-sync-executor, whose exports live in its
       # gitignored dist/ — without this build the import fails with
-      # "Cannot find package 'lime-sync-executor'".
+      # "Cannot find package '@o/lime-sync-executor'".
       - name: build sync runtime
         run: bun run build:sync-runtime
 

@@ -94,7 +94,7 @@ ingest parity is described as a follow-up in
 
 ### packages/lime-sync-cf-host
 
-The Cloudflare Durable Object host, published to npm as `lime-sync-cf-host`.
+The Cloudflare Durable Object host, published to npm as `@o/lime-sync-cf-host`.
 This is the layer real apps consume. It is TypeScript plus the vendored WASM
 engine, and it exports two factories from `src/index.ts`:
 
@@ -112,15 +112,15 @@ mutators or push delegation, upstream ingest) is passed in as one
 `SyncHostConfig` object. That object is the entire public API; the configuration
 page documents every field.
 
-`lime-sync` exposes the shared application-database boundary. Both hosts call
+`@o/lime-sync` exposes the shared application-database boundary. Both hosts call
 it for registered mutators, CRUD SQL, last-mutation-id ownership, replay, and
 deferred effects. Node and bun applications launch the Rust host through
-`lime-sync/native`. The CF host keeps the Rust pull and ingest engine compiled
+`@o/lime-sync/native`. The CF host keeps the Rust pull and ingest engine compiled
 to WASM.
 
 ### packages/lime-sync-browser-host
 
-The browser host is exported as `lime-sync/browser`. It loads sync-wasm
+The browser host is exported as `@o/lime-sync/browser`. It loads sync-wasm
 and Bedrock SQLite in one worker and serves the same authenticated `/pull` and
 `/push` protocol through a `MessagePort`. The same port also exposes serialized
 direct `query` and `exec` calls for preview tooling. All attached clients receive
@@ -141,7 +141,7 @@ fallback.
 
 The host accepts the application's mutator registry and named-query resolver so
 generated validators, permissions, transaction helpers, and deferred effects
-keep working without a second mutation-bookkeeping path. The `lime-sync` package
+keep working without a second mutation-bookkeeping path. The `@o/lime-sync` package
 includes both WASM binaries beside the subpath export, so ordinary worker
 bundles do not need consumer-specific asset copies.
 
@@ -266,7 +266,7 @@ On Cloudflare the deployment has two Durable Object roles:
   pushes. Application writes and sync ingestion share the same authoritative
   SQLite object without a Postgres compatibility layer.
 
-The canonical Orez transport integration lives at `lime-sync/client`, with
+The canonical Orez transport integration lives at `@o/lime-sync/client`, with
 source in `packages/lime-sync/src/client/`. It keeps `@rocicorp/zero` as the
 client and maps its sync connection onto the Lime Sync pull, push, and wake
 server endpoints. Downstream vendored copies are refreshed from this

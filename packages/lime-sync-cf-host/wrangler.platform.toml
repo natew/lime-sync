@@ -4,7 +4,7 @@ compatibility_date = "2026-06-01"
 
 [[rules]]
 type = "CompiledWasm"
-globs = ["lime-sync-cf-host/wasm-module.wasm"]
+globs = ["@o/lime-sync-cf-host/wasm-module.wasm"]
 fallthrough = true
 
 [[durable_objects.bindings]]

@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [[rules]]
 type = "CompiledWasm"
-globs = ["lime-sync-cf-host/wasm-module.wasm"]
+globs = ["@o/lime-sync-cf-host/wasm-module.wasm"]
 fallthrough = true
 
 [vars]

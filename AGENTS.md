@@ -26,7 +26,7 @@ path. Pin the cost in a test, not a comment
 ## Canonical imports
 
 Implementation may live in sub-packages, but consumers always import through
-the parent: `lime-sync/realtime`, never `lime-sync-executor/realtime`. Direct
+the parent: `@o/lime-sync/realtime`, never `@o/lime-sync-executor/realtime`. Direct
 sub-package imports are allowed only inside this repo where going through the
 parent would create a cycle.
 

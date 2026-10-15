@@ -1,5 +1,5 @@
-import { trackBillableCursorRows } from 'lime-sync-executor/sql-billing'
-import { encodeSqlValue } from 'lime-sync-executor/sqlite'
+import { trackBillableCursorRows } from '@o/lime-sync-executor/sql-billing'
+import { encodeSqlValue } from '@o/lime-sync-executor/sqlite'
 
 import { executeTransactionQueryPlan } from './transaction-query.js'
 
@@ -12,9 +12,9 @@ import type {
   ApplicationTransaction,
   ExecResult,
   SqlStatementMetadata,
-} from 'lime-sync-executor'
-import type { TransactionQueryFormat } from 'lime-sync-executor'
-import type { SqlWireValue } from 'lime-sync-executor/sqlite'
+} from '@o/lime-sync-executor'
+import type { TransactionQueryFormat } from '@o/lime-sync-executor'
+import type { SqlWireValue } from '@o/lime-sync-executor/sqlite'
 
 type WireValue = SqlWireValue
 

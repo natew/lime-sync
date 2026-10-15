@@ -358,7 +358,7 @@ list-append --consistency-models serializable`, failing the job on `false`,
    coverage at all until 2026-08-18.** `harness/src/backup-restore.ts` covers
    the sync host's own backup and stops the writer first
    (`/admin/writer`, `backup-restore.ts:52`), so it structurally cannot observe
-   a write racing an export. The separate `lime-sync` namespace backup, which
+   a write racing an export. The separate `@o/lime-sync` namespace backup, which
    dumps a whole namespace to R2 for disaster recovery
    (`packages/lime-sync/src/cf-do/namespace-backup.ts`), is covered by
    `namespace-backup.test.ts` plus the production wiring test in

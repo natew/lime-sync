@@ -1,7 +1,7 @@
 {
-  "name": "lime-sync-executor",
+  "name": "@o/lime-sync-executor",
   "version": "0.16.20",
-  "description": "Internal orez engine package. Do not import directly: consumers use lime-sync (e.g. lime-sync/realtime).",
+  "description": "Internal orez engine package. Do not import directly: consumers use @o/lime-sync (e.g. @o/lime-sync/realtime).",
   "type": "module",
   "sideEffects": false,
   "exports": {

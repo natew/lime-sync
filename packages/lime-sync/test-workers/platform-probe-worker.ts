@@ -1,4 +1,4 @@
-import { createQueryCompiler } from 'lime-sync-cf-host/query-compiler'
+import { createQueryCompiler } from '@o/lime-sync-cf-host/query-compiler'
 
 import {
   SqlStorageDirect,
@@ -22,7 +22,7 @@ import {
 import { createApplicationSqlClient, ZeroDO } from '../src/cf-do/worker.js'
 
 import type { SqlStorageFailure } from '../../lime-sync-cf-host/src/sql-storage-adapter.js'
-import type { TransactionQueryFormat, ZeroSchemaConfig } from 'lime-sync-executor'
+import type { TransactionQueryFormat, ZeroSchemaConfig } from '@o/lime-sync-executor'
 
 interface Env {
   PROBE_DO: DurableObjectNamespace<ProbeDurableObject>

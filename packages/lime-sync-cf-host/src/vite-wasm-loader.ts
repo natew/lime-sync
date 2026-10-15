@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 
 import type { Plugin } from 'vite'
 
-const wasmModuleID = 'lime-sync-cf-host/wasm-module.wasm'
+const wasmModuleID = '@o/lime-sync-cf-host/wasm-module.wasm'
 const resolvedWasmModuleID = `\0${wasmModuleID}`
 
 type OrezSyncCfHostWasmOptions = {
@@ -12,7 +12,7 @@ type OrezSyncCfHostWasmOptions = {
 
 /** load the sync engine into a Vite SSR graph for Node or Workerd. */
 export function orezSyncCfHostWasm(options: OrezSyncCfHostWasmOptions = {}): Plugin[] {
-  const noExternal = ['lime-sync-cf-host', ...(options.noExternal ?? [])]
+  const noExternal = ['@o/lime-sync-cf-host', ...(options.noExternal ?? [])]
   let command: 'build' | 'serve' = 'serve'
   return [
     {

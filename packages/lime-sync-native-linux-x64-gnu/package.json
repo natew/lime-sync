@@ -1,5 +1,5 @@
 {
-  "name": "lime-sync-native-linux-x64-gnu",
+  "name": "@o/lime-sync-native-linux-x64-gnu",
   "version": "0.1.6",
   "description": "Prebuilt Orez sync-native host for Linux x64 glibc",
   "license": "MIT",

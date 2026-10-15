@@ -9,9 +9,9 @@ export const WORKERS_DEV_URL_PATTERN =
 export function isOrezLiteImporter(importer: string): boolean {
   const normalized = importer.replaceAll('\\', '/')
   return (
-    normalized.includes('/node_modules/lime-sync/') ||
-    normalized.includes('/node_modules/lime-sync-cf-host/') ||
-    normalized.includes('/node_modules/lime-sync-executor/') ||
+    normalized.includes('/node_modules/@o/lime-sync/') ||
+    normalized.includes('/node_modules/@o/lime-sync-cf-host/') ||
+    normalized.includes('/node_modules/@o/lime-sync-executor/') ||
     normalized.includes('/packages/lime-sync/') ||
     normalized.includes('/packages/lime-sync-cf-host/') ||
     normalized.includes('/packages/lime-sync-executor/')

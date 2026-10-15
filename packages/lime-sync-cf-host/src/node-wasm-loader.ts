@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import * as nodeModule from 'node:module'
 import { fileURLToPath } from 'node:url'
 
-const wasmModuleID = 'lime-sync-cf-host/wasm-module.wasm'
+const wasmModuleID = '@o/lime-sync-cf-host/wasm-module.wasm'
 const wasmModulePath = fileURLToPath(import.meta.resolve(wasmModuleID))
 const wasmBase64 = readFileSync(wasmModulePath).toString('base64')
 const wasmModuleSource = `import { Buffer } from 'node:buffer'
@@ -20,7 +20,7 @@ const registerHooks = Reflect.get(nodeModule, 'registerHooks') as
   | RegisterHooks
   | undefined
 if (!registerHooks) {
-  throw new Error('lime-sync-cf-host/node-wasm-loader requires Node 22.15 or newer')
+  throw new Error('@o/lime-sync-cf-host/node-wasm-loader requires Node 22.15 or newer')
 }
 
 registerHooks({

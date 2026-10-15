@@ -6,7 +6,7 @@ SQLite triggers, the backfill SQL installed with the schema migration, and the
 client-side projection used during optimistic Zero mutations.
 
 ```ts
-import { count, defineAggregates, sum } from 'lime-sync/aggregate'
+import { count, defineAggregates, sum } from '@o/lime-sync/aggregate'
 import { schema } from './data/generated/schema'
 
 export const aggregates = defineAggregates(schema, {
@@ -63,7 +63,7 @@ A project declares aggregates in `data/<namespace>/aggregates.ts`, exporting the
 definitions themselves rather than a compiled set:
 
 ```ts
-import { count, type AggregateDefinitions } from 'lime-sync/aggregate'
+import { count, type AggregateDefinitions } from '@o/lime-sync/aggregate'
 import { schema } from '../generated/schema'
 
 export const aggregates = {

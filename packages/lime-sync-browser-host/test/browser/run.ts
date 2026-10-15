@@ -14,7 +14,10 @@ await mkdir(join(outputDirectory, 'generated'), { recursive: true })
 
 await build({
   alias: {
-    'lime-sync/browser': join(repositoryRoot, 'packages/lime-sync/dist/browser/index.js'),
+    '@o/lime-sync/browser': join(
+      repositoryRoot,
+      'packages/lime-sync/dist/browser/index.js'
+    ),
   },
   entryPoints: {
     main: join(import.meta.dir, 'main.ts'),
