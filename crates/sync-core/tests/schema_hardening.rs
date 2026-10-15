@@ -1,0 +1,410 @@
+// HIGH-3 regression: DDL injection via trigger identifiers. table/column names
+// reach CREATE TRIGGER statements, so a hostile name must be neutralized two
+// ways: the trigger identifier is quoted/escaped (so no name can break out of
+// the DDL), and from_zero_schema rejects names that are not plain identifiers at
+// ingest.
+mod common;
+
+use common::TestDb;
+use serde_json::json;
+
+use sync_core::query::{handle_query_pull, init_query_schema};
+use sync_core::schema::TableSpec;
+use sync_core::value::ZeroColumnType;
+use sync_core::{SqlValue, SyncDb, Tables, Transactor, init_schema, trigger_ddl};
+
+// the classic breakout payload: a table name that, unescaped, closes the trigger
+// name and appends an injected trigger that deletes from a victim table.
+const INJECT: &str = r#"x" AFTER INSERT ON "victim" BEGIN DELETE FROM "victim"; END; --"#;
+
+#[test]
+fn from_zero_schema_rejects_injection_shaped_table_name() {
+    let schema = json!({
+        "tables": {
+            INJECT: {
+                "columns": { "id": { "type": "string" } },
+                "primaryKey": ["id"],
+            }
+        }
+    });
+    let err = Tables::from_zero_schema(&schema).unwrap_err();
+    assert!(
+        err.contains("not a valid identifier"),
+        "expected identifier rejection, got: {err}"
+    );
+}
+
+#[test]
+fn from_zero_schema_rejects_injection_shaped_column_name() {
+    let schema = json!({
+        "tables": {
+            "issue": {
+                "columns": { "id\" , 1); DROP TABLE issue; --": { "type": "string" } },
+                "primaryKey": ["id"],
+            }
+        }
+    });
+    let err = Tables::from_zero_schema(&schema).unwrap_err();
+    assert!(err.contains("not a valid identifier"), "got: {err}");
+}
+
+#[test]
+fn from_zero_schema_accepts_normal_camelcase_schema() {
+    // the guard must not reject legitimate Zero schema names (camelCase tables +
+    // columns, underscores).
+    let schema = json!({
+        "tables": {
+            "serverMember": {
+                "columns": {
+                    "id": { "type": "string" },
+                    "serverId": { "type": "string" },
+                    "user_id": { "type": "string" },
+                },
+                "primaryKey": ["id"],
+            }
+        }
+    });
+    let tables = Tables::from_zero_schema(&schema).unwrap();
+    assert!(tables.get("serverMember").is_some());
+}
+
+#[test]
+fn initializes_triggers_for_soot_server_names() {
+    let schema = json!({
+        "tables": {
+            "userState": {
+                "name": "userState",
+                "serverName": "user_state",
+                "columns": {
+                    "userId": {
+                        "type": "string",
+                        "serverName": "user_id",
+                    },
+                    "monthlyTokens": {
+                        "type": "number",
+                        "serverName": "monthly_tokens",
+                    },
+                },
+                "primaryKey": ["userId"],
+            }
+        }
+    });
+    let tables = Tables::from_zero_schema(&schema).unwrap();
+    let mut db = TestDb::memory();
+    db.exec(
+        "CREATE TABLE user_state (user_id TEXT PRIMARY KEY, monthly_tokens REAL NOT NULL)",
+        &[],
+    )
+    .unwrap();
+
+    init_schema(&mut db, &tables).unwrap();
+    init_query_schema(&mut db).unwrap();
+    let snapshot = db
+        .transaction(|database| {
+            handle_query_pull(
+                database,
+                &tables,
+                4096,
+                &json!({
+                    "clientID": "c1", "clientGroupID": "g1", "cookie": null,
+                    "queries": { "version": 1, "patch": [
+                        { "op": "put", "hash": "q_all", "ast": { "table": "userState" } },
+                    ]},
+                }),
+                "u1",
+            )
+        })
+        .unwrap();
+    db.exec("INSERT INTO user_state VALUES ('u1', 42)", &[])
+        .unwrap();
+    let diff = db
+        .transaction(|database| {
+            handle_query_pull(
+                database,
+                &tables,
+                4096,
+                &json!({
+                    "clientID": "c1", "clientGroupID": "g1", "cookie": snapshot["cookie"]
+                }),
+                "u1",
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        diff["rowsPatch"],
+        json!([{
+            "op": "put",
+            "tableName": "user_state",
+            "value": { "user_id": "u1", "monthly_tokens": 42 },
+        }])
+    );
+}
+
+#[test]
+fn rows_patch_uses_physical_names_for_identity_and_mapped_schema() {
+    let cases = [
+        (
+            "identity",
+            json!({
+                "tables": {
+                    "userState": {
+                        "columns": {
+                            "userId": { "type": "string" },
+                            "monthlyTokens": { "type": "number" },
+                        },
+                        "primaryKey": ["userId"],
+                    }
+                }
+            }),
+            "CREATE TABLE userState (userId TEXT PRIMARY KEY, monthlyTokens REAL NOT NULL)",
+            "INSERT INTO userState VALUES ('u1', 42)",
+            "DELETE FROM userState WHERE userId = 'u1'",
+            json!({
+                "op": "put",
+                "tableName": "userState",
+                "value": { "userId": "u1", "monthlyTokens": 42 },
+            }),
+            json!({ "op": "del", "tableName": "userState", "id": { "userId": "u1" } }),
+        ),
+        (
+            "mapped",
+            json!({
+                "tables": {
+                    "userState": {
+                        "serverName": "user_state",
+                        "columns": {
+                            "userId": { "type": "string", "serverName": "user_id" },
+                            "monthlyTokens": {
+                                "type": "number",
+                                "serverName": "monthly_tokens",
+                            },
+                        },
+                        "primaryKey": ["userId"],
+                    }
+                }
+            }),
+            "CREATE TABLE user_state (user_id TEXT PRIMARY KEY, monthly_tokens REAL NOT NULL)",
+            "INSERT INTO user_state VALUES ('u1', 42)",
+            "DELETE FROM user_state WHERE user_id = 'u1'",
+            json!({
+                "op": "put",
+                "tableName": "user_state",
+                "value": { "user_id": "u1", "monthly_tokens": 42 },
+            }),
+            json!({ "op": "del", "tableName": "user_state", "id": { "user_id": "u1" } }),
+        ),
+    ];
+
+    for (label, schema, ddl, seed, delete, expected_put, expected_del) in cases {
+        let tables = Tables::from_zero_schema(&schema).unwrap();
+        let mut db = TestDb::memory();
+        db.exec(ddl, &[]).unwrap();
+        db.exec(seed, &[]).unwrap();
+        init_schema(&mut db, &tables).unwrap();
+        init_query_schema(&mut db).unwrap();
+
+        let logical_table = tables.iter().next().unwrap().0.to_string();
+        let snapshot = db
+            .transaction(|database| {
+                handle_query_pull(
+                    database,
+                    &tables,
+                    4096,
+                    &json!({
+                        "clientID": "c1", "clientGroupID": "g1", "cookie": null,
+                        "queries": { "version": 1, "patch": [
+                            { "op": "put", "hash": "q_all", "ast": { "table": logical_table } },
+                        ]},
+                    }),
+                    "u1",
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot["rowsPatch"],
+            json!([{ "op": "clear" }, expected_put]),
+            "{label}"
+        );
+
+        db.exec(delete, &[]).unwrap();
+        let diff = db
+            .transaction(|database| {
+                handle_query_pull(
+                    database,
+                    &tables,
+                    4096,
+                    &json!({ "clientID": "c1", "clientGroupID": "g1", "cookie": snapshot["cookie"] }),
+                    "u1",
+                )
+            })
+            .unwrap();
+        assert_eq!(diff["rowsPatch"], json!([expected_del]), "{label}");
+    }
+}
+
+#[test]
+fn exact_capture_keeps_database_trigger_side_effects() {
+    let tables = Tables::from_zero_schema(&json!({
+        "tables": {
+            "expense": {
+                "columns": { "id": { "type": "string" } },
+                "primaryKey": ["id"],
+            },
+            "expenseSummary": {
+                "columns": {
+                    "id": { "type": "string" },
+                    "count": { "type": "number" },
+                },
+                "primaryKey": ["id"],
+            },
+        }
+    }))
+    .unwrap();
+    let mut db = TestDb::memory();
+    db.exec("CREATE TABLE expense (id TEXT PRIMARY KEY)", &[])
+        .unwrap();
+    db.exec(
+        "CREATE TABLE expenseSummary (id TEXT PRIMARY KEY, count INTEGER NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    db.exec(
+        "CREATE TRIGGER expense_summary_insert AFTER INSERT ON expense BEGIN
+           INSERT INTO expenseSummary (id, count) VALUES ('all', 1)
+           ON CONFLICT (id) DO UPDATE SET count = count + 1;
+         END",
+        &[],
+    )
+    .unwrap();
+    init_schema(&mut db, &tables).unwrap();
+
+    db.exec(
+        "UPDATE _zsync_log_segments SET captureMode = 1
+         WHERE startVersion = (SELECT MAX(startVersion) FROM _zsync_log_segments)",
+        &[],
+    )
+    .unwrap();
+    let changes_before = db.conn.total_changes();
+    db.exec("INSERT INTO expense (id) VALUES ('expense-1')", &[])
+        .unwrap();
+    assert_eq!(
+        db.conn.total_changes() - changes_before,
+        4,
+        "one source row, one derived row, and one pending-key write for each",
+    );
+
+    let rows = db
+        .query(
+            "SELECT pending FROM _zsync_log_segments ORDER BY startVersion DESC LIMIT 1",
+            &[],
+        )
+        .unwrap();
+    let pending = match rows[0].get("pending") {
+        Some(SqlValue::Text(value)) => serde_json::from_str::<serde_json::Value>(value).unwrap(),
+        value => panic!("expected pending JSON text, got {value:?}"),
+    };
+    assert_eq!(
+        pending,
+        json!([
+            ["expense", { "id": "expense-1" }],
+            ["expenseSummary", { "id": "all" }],
+        ])
+    );
+}
+
+#[test]
+fn server_names_fall_back_to_logical_names_and_reject_physical_collisions() {
+    let identity = Tables::from_zero_schema(&json!({
+        "tables": {
+            "userState": {
+                "columns": { "userId": { "type": "string" } },
+                "primaryKey": ["userId"],
+            }
+        }
+    }))
+    .unwrap();
+    assert_eq!(identity.physical_name("userState"), Some("userState"));
+    assert_eq!(
+        identity.physical_column("userState", "userId"),
+        Some("userId")
+    );
+
+    let duplicate_tables = Tables::from_zero_schema(&json!({
+        "tables": {
+            "first": {
+                "serverName": "record",
+                "columns": { "id": { "type": "string" } },
+                "primaryKey": ["id"],
+            },
+            "second": {
+                "serverName": "RECORD",
+                "columns": { "id": { "type": "string" } },
+                "primaryKey": ["id"],
+            },
+        }
+    }))
+    .unwrap_err();
+    assert!(duplicate_tables.contains("duplicate physical table mapping"));
+
+    let duplicate_columns = Tables::from_zero_schema(&json!({
+        "tables": {
+            "record": {
+                "columns": {
+                    "first": { "type": "string", "serverName": "value" },
+                    "second": { "type": "string", "serverName": "VALUE" },
+                },
+                "primaryKey": ["first"],
+            }
+        }
+    }))
+    .unwrap_err();
+    assert!(duplicate_columns.contains("duplicate physical column mapping"));
+}
+
+#[test]
+fn trigger_name_is_quoted_so_a_hostile_table_cannot_inject() {
+    // even when Tables is built directly (bypassing from_zero_schema), the trigger
+    // NAME is quote-escaped, so installing triggers for a hostile table name can
+    // never create a rogue trigger on another table. we prove it at runtime: the
+    // `victim` table keeps its rows after an INSERT that a successful injection
+    // would have turned into a DELETE.
+    let mut db = TestDb::memory();
+    db.exec("CREATE TABLE victim (id TEXT PRIMARY KEY)", &[])
+        .unwrap();
+    db.exec("INSERT INTO victim VALUES ('keep')", &[]).unwrap();
+
+    let tables = Tables::new().with(
+        INJECT,
+        TableSpec {
+            columns: vec![("id".into(), ZeroColumnType::String)],
+            primary_key: vec!["id".into()],
+            encrypted_columns: Default::default(),
+            encrypted_physical_columns: Default::default(),
+        },
+    );
+    // the hostile name resolves to one escaped identifier naming a table that does
+    // not exist, so init_schema may error; what matters is that no injected
+    // trigger on `victim` is installed.
+    let _ = init_schema(&mut db, &tables);
+
+    db.exec("INSERT INTO victim VALUES ('after')", &[]).unwrap();
+    let rows = db.query("SELECT id FROM victim", &[]).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "an injected AFTER INSERT trigger on victim would have deleted its rows"
+    );
+
+    // and the generated DDL escapes the embedded quote in the trigger identifier
+    // (doubled), never leaving the vulnerable bare-quote breakout. the fixed form
+    // is `_zsync_tr_x"" AFTER`; the vulnerable form was `_zsync_tr_x" AFTER`.
+    let ddl = trigger_ddl(&tables).join("\n");
+    assert!(
+        !ddl.contains("_zsync_tr_x\" AFTER"),
+        "trigger name broke out of its quotes:\n{ddl}"
+    );
+    assert!(
+        ddl.contains("_zsync_tr_x\"\" AFTER"),
+        "expected doubled quote"
+    );
+}

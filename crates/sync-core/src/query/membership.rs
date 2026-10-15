@@ -1,0 +1,1722 @@
+// durable query-aware state and the recomputation + membership-diff algorithm
+// (the plan's "First algorithm: recomputation and membership diff (CVR-lite)").
+// created only when a host enables the feature (init_query_schema), so the
+// baseline M1 surface is untouched. all functions assume the host has a
+// transaction open; none emits BEGIN/COMMIT.
+//
+// model (everything scoped per client GROUP, since a replica is shared across a
+// group's tabs):
+// - _zsync_queries:    (group, hash) -> transformed AST + root table + dependency
+//                      tables + transform version. scoped by group because the
+//                      hash is client-chosen: a global row would let one group's
+//                      permission-transformed AST overwrite another group's under
+//                      the same hash and leak forbidden rows (invariant 15).
+// - _zsync_desires:    (group, client, hash) -> the client's query-state version
+// - _zsync_query_rows: (group, hash) -> the rows currently in that query's result
+// - _zsync_row_refs:   (group, rowTable, rowPk) -> how many of the group's active
+//                      queries reference the row; the row is delivered while the
+//                      count is positive and deleted only when it reaches zero
+//                      (invariant 14). each membership transition carries the
+//                      watermark that observed it: addedVersion while live, and a
+//                      refcount-0 TOMBSTONE with removedVersion after departure.
+//                      a recompute delivers a transition inline only to the client
+//                      whose pull observed it, so every other client in the group
+//                      (its own replica, an older cookie) must find the
+//                      transition here — otherwise its cookie advances past a
+//                      departure it never received and the row ghosts forever.
+//                      tombstones at or below the retain floor are pruned; a
+//                      client below the floor gets a full response anyway.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Value, json};
+
+use crate::db::{Row, SqlValue, SyncDb};
+use crate::error::EngineError;
+use crate::schema::{TableSpec, Tables};
+use crate::value::{zero_pk_id, zero_row};
+
+use super::ast::{Ast, Condition, CorrelatedSubquery};
+use super::compile::{compile_predicate_probe, compile_related_of};
+use super::{compile, parse_ast};
+
+// bound parameters one statement may carry: the Durable Object SQL limit
+const SQL_BIND_LIMIT: usize = 100;
+
+// union branches one statement may carry: workerd hard-sets
+// SQLITE_LIMIT_COMPOUND_SELECT to 5 (stock SQLite defaults to 500), so a
+// bind-budgeted union that is fine locally 500s on the DO past 5 branches.
+const SQL_COMPOUND_TERM_LIMIT: usize = 5;
+
+// bind a pk column (parsed from a canonical pk json) as a sqlite value
+pub(crate) fn json_pk_to_sql(v: Option<&Value>) -> SqlValue {
+    match v {
+        None | Some(Value::Null) => SqlValue::Null,
+        Some(Value::Bool(b)) => SqlValue::Integer(if *b { 1 } else { 0 }),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(SqlValue::Integer)
+            .unwrap_or_else(|| SqlValue::Real(n.as_f64().unwrap_or(0.0))),
+        Some(Value::String(s)) => SqlValue::Text(s.clone()),
+        Some(other) => SqlValue::Text(other.to_string()),
+    }
+}
+
+fn text(s: impl Into<String>) -> SqlValue {
+    SqlValue::Text(s.into())
+}
+
+// canonical pk encoding lives in `value` so membership keys, delete ids, and
+// realtime topics all share one build-independent encoder.
+use crate::value::canonical_pk;
+
+// raw (non-zero-typed) primary-key object of a live row, for keying membership
+// and for building del ids
+fn raw_pk(spec: &TableSpec, row: &crate::db::Row) -> Value {
+    let mut pk = serde_json::Map::new();
+    for col in &spec.primary_key {
+        let v = match row.get(col) {
+            Some(SqlValue::Null) | None => Value::Null,
+            Some(SqlValue::Integer(i)) => json!(i),
+            Some(SqlValue::Real(f)) => crate::value::f64_to_json(*f),
+            Some(SqlValue::Text(s)) => json!(s),
+            Some(SqlValue::Blob(b)) => json!(String::from_utf8_lossy(b)),
+        };
+        pk.insert(col.clone(), v);
+    }
+    Value::Object(pk)
+}
+
+// the current query-aware schema version. bump when a query-aware table changes
+// shape, and add the forward migration in migrate_query_schema.
+//
+// v3: rowPk switched from serde_json's build-dependent map order to the
+// schema's declared primary-key order (see value::canonical_pk). single-column
+// pks encode identically, but a composite pk written by a wasm build sorted its
+// columns, so those stored keys no longer match a recompute. the query-aware
+// tables rebuild from the next desiredQueriesPatch, so the version bump resets
+// them instead of migrating each key.
+//
+// v4: _zsync_row_refs gained addedVersion/removedVersion so membership
+// transitions replay to every client of a group, not only the one whose pull
+// observed them. the reset path rebuilds the tables at the new shape.
+//
+// v5: the SQLite compiler stopped sending long simple LIKE patterns through
+// GLOB. reset derived query state and bump the epoch so groups wedged by a
+// previously stored long pattern resend their desires through the fixed
+// compiler without requiring a fresh browser context.
+pub(crate) const QUERY_SCHEMA_VERSION: i64 = 5;
+
+fn table_exists(db: &mut dyn SyncDb, name: &str) -> Result<bool, EngineError> {
+    let rows = db.query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        &[text(name)],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+fn read_query_meta_version(db: &mut dyn SyncDb) -> Result<i64, EngineError> {
+    let rows = db.query(
+        "SELECT CAST(version AS TEXT) AS v FROM _zsync_query_meta WHERE lock = 1",
+        &[],
+    )?;
+    match rows.first().and_then(|r| r.get("v")) {
+        Some(SqlValue::Text(s)) => Ok(s.parse().unwrap_or(0)),
+        _ => Ok(0),
+    }
+}
+
+// forward-only migration for the query-aware tables, driven by the stored schema
+// version. CREATE TABLE IF NOT EXISTS cannot alter an existing table, so a shape
+// change (e.g. the pre-CRITICAL-2 hash-only _zsync_queries with no clientGroupID)
+// needs an explicit migration. the query-aware state is fully reconstructable from
+// clients' next desiredQueriesPatch + recompute and the old rows carry no client
+// group to backfill, so an out-of-date version RESETS the query-aware tables (init
+// recreates them at the current version). a version NEWER than this engine fails
+// loud rather than silently downgrading. baseline _zsync_* tables are untouched.
+fn migrate_query_schema(db: &mut dyn SyncDb) -> Result<(), EngineError> {
+    // determine the stored version: from _zsync_query_meta if present, else infer
+    // from the _zsync_queries shape (pre-versioning installs have no meta table —
+    // a group-scoped _zsync_queries is v1, a hash-only one is v0). no query tables
+    // at all means a fresh install with nothing to migrate.
+    let stored_version = if table_exists(db, "_zsync_query_meta")? {
+        read_query_meta_version(db)?
+    } else {
+        let queries_sql = db
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_zsync_queries'",
+                &[],
+            )?
+            .first()
+            .and_then(|r| match r.get("sql") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            });
+        match queries_sql {
+            Some(sql) if sql.contains("clientGroupID") => 1,
+            Some(_) => 0,
+            None => return Ok(()), // fresh install
+        }
+    };
+
+    if stored_version > QUERY_SCHEMA_VERSION {
+        return Err(EngineError::internal(format!(
+            "query-schema version {stored_version} is newer than this engine's {QUERY_SCHEMA_VERSION}; refusing to downgrade"
+        )));
+    }
+    if stored_version == QUERY_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // out of date: reset the query-aware tables (init recreates them at the current
+    // version) AND bump the epoch, so every client's cookie is stale and it
+    // full-resyncs — re-sending its desired queries. without the epoch bump a
+    // caught-up client fast-paths to {unchanged} forever and never re-sends its
+    // already-acked patch, and the wiped membership can no longer delete its stale
+    // rows (GAP-3a).
+    for table in [
+        "_zsync_queries",
+        "_zsync_desires",
+        "_zsync_query_ack",
+        "_zsync_query_rows",
+        "_zsync_row_refs",
+        "_zsync_query_state",
+        "_zsync_query_transform_group",
+        "_zsync_query_transform_client",
+        "_zsync_query_meta",
+        "_zsync_wake_keys",
+        "_zsync_wake_recipes",
+        "_zsync_wake_meta",
+    ] {
+        db.exec(&format!("DROP TABLE IF EXISTS {table}"), &[])?;
+    }
+    crate::store::invalidate(db)?;
+    Ok(())
+}
+
+pub fn init_query_schema(db: &mut dyn SyncDb) -> Result<(), EngineError> {
+    migrate_query_schema(db)?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_meta (
+            lock INTEGER PRIMARY KEY CHECK (lock = 1),
+            version INTEGER NOT NULL
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_queries (
+            clientGroupID TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            ast TEXT NOT NULL,
+            rootTable TEXT NOT NULL,
+            deps TEXT NOT NULL,
+            transformVersion INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (clientGroupID, hash)
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_desires (
+            clientGroupID TEXT NOT NULL,
+            clientID TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            clientVersion INTEGER NOT NULL,
+            PRIMARY KEY (clientGroupID, clientID, hash)
+        )",
+        &[],
+    )?;
+    // the monotonic acknowledged query-state version per (group, client). the
+    // gotQueries ack is read from here, NOT from the max over current desire rows:
+    // a del/clear removes desires but must never regress the acked version
+    // (MEDIUM-6). every applied desiredQueriesPatch advances it to max(stored,
+    // patch.version).
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_ack (
+            clientGroupID TEXT NOT NULL,
+            clientID TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            PRIMARY KEY (clientGroupID, clientID)
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_transform_group (
+            clientGroupID TEXT PRIMARY KEY,
+            version INTEGER NOT NULL
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_transform_client (
+            clientGroupID TEXT NOT NULL,
+            clientID TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            PRIMARY KEY (clientGroupID, clientID)
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_rows (
+            clientGroupID TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            rowTable TEXT NOT NULL,
+            rowPk TEXT NOT NULL,
+            PRIMARY KEY (clientGroupID, hash, rowTable, rowPk)
+        )",
+        &[],
+    )?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_row_refs (
+            clientGroupID TEXT NOT NULL,
+            rowTable TEXT NOT NULL,
+            rowPk TEXT NOT NULL,
+            refcount INTEGER NOT NULL,
+            addedVersion INTEGER NOT NULL,
+            removedVersion INTEGER,
+            PRIMARY KEY (clientGroupID, rowTable, rowPk)
+        )",
+        &[],
+    )?;
+    // the transition replay in every non-full pull filters by version; without
+    // these the OR predicate scans the group's whole membership each pull.
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS _zsync_row_refs_added
+         ON _zsync_row_refs (clientGroupID, addedVersion)",
+        &[],
+    )?;
+    // the deactivation check and the active-query load filter desires by
+    // (group, hash); the primary key leads with clientID, so without this
+    // every pull walks the whole group's desires (clients x queries) and
+    // Cloudflare bills every row scanned. desires change only when a client
+    // edits its query set, so the write side costs one index row per patch.
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS _zsync_desires_group_hash
+         ON _zsync_desires (clientGroupID, hash)",
+        &[],
+    )?;
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS _zsync_row_refs_removed
+         ON _zsync_row_refs (clientGroupID, removedVersion) WHERE refcount = 0",
+        &[],
+    )?;
+    // marks a (group, query) whose membership has been computed at least once.
+    // recomputation narrowing skips a query whose dependency tables were not
+    // touched, EXCEPT one with no marker yet (a newly desired query, or one
+    // whose AST changed and had its marker cleared), which always recomputes.
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_query_state (
+            clientGroupID TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            PRIMARY KEY (clientGroupID, hash)
+        )",
+        &[],
+    )?;
+    // record the schema version so a future shape change can migrate forward.
+    db.exec(
+        "INSERT INTO _zsync_query_meta (lock, version) VALUES (1, ?)
+         ON CONFLICT (lock) DO UPDATE SET version = excluded.version
+         WHERE version <> excluded.version",
+        &[SqlValue::Integer(QUERY_SCHEMA_VERSION)],
+    )?;
+    super::wake::init_wake_schema(db)
+}
+
+// register (or replace) a query for a client GROUP by its stable hash. validates
+// + compiles the transformed AST so an invalid query is rejected here, not at
+// pull time, and records the root table + dependency tables recomputation
+// narrows on, plus the consumer-supplied transformation version.
+//
+// scoping by (group, hash) is a security boundary: the hash is client-chosen, so
+// a globally-keyed row would let group B register a permissive AST under group
+// A's hash and overwrite A's restricted (permission-transformed) definition,
+// leaking forbidden rows on A's next pull (invariant 15). each group keeps its
+// own definition; a change to the AST OR the transformation version clears just
+// this group's computed markers so its next pull recomputes and can never retain
+// a more-permissive older result.
+pub fn register_query(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    hash: &str,
+    ast_json: &Value,
+    transform_version: i64,
+) -> Result<(), EngineError> {
+    let ast = parse_ast(ast_json)?;
+    compile(&ast, tables)?; // validate + reject unsupported shapes here
+    // the dependency set includes related-output and EXISTS child tables (not
+    // just the root query's), so touched-table narrowing never skips a query
+    // whose child rows changed.
+    let mut dep_set = BTreeSet::new();
+    super::ast::collect_dependency_tables(&ast, &mut dep_set);
+    let deps = serde_json::to_string(&dep_set).unwrap();
+    let ast_text = serde_json::to_string(ast_json).unwrap();
+
+    let prev = db.query(
+        "SELECT ast, CAST(transformVersion AS TEXT) AS tv FROM _zsync_queries
+         WHERE clientGroupID = ? AND hash = ?",
+        &[text(group), text(hash)],
+    )?;
+    let (prev_ast, prev_tv) = match prev.first() {
+        Some(r) => (
+            str_col(r.get("ast")).ok(),
+            match r.get("tv") {
+                Some(SqlValue::Text(s)) => s.parse::<i64>().unwrap_or(0),
+                _ => 0,
+            },
+        ),
+        None => (None, 0),
+    };
+    let changed = prev_ast.as_deref() != Some(ast_text.as_str()) || prev_tv != transform_version;
+
+    if changed {
+        db.exec(
+            "INSERT INTO _zsync_queries (clientGroupID, hash, ast, rootTable, deps, transformVersion)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (clientGroupID, hash) DO UPDATE SET ast = excluded.ast,
+                 rootTable = excluded.rootTable, deps = excluded.deps,
+                 transformVersion = excluded.transformVersion",
+            &[
+                text(group),
+                text(hash),
+                text(ast_text),
+                text(&ast.table),
+                text(deps),
+                SqlValue::Text(transform_version.to_string()),
+            ],
+        )?;
+        db.exec(
+            "DELETE FROM _zsync_query_state WHERE clientGroupID = ? AND hash = ?",
+            &[text(group), text(hash)],
+        )?;
+        super::wake::store_plan(db, tables, group, hash, &ast)?;
+    }
+    Ok(())
+}
+
+pub fn set_desire(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+    hash: &str,
+    client_version: i64,
+) -> Result<(), EngineError> {
+    db.exec(
+        "INSERT INTO _zsync_desires (clientGroupID, clientID, hash, clientVersion)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (clientGroupID, clientID, hash) DO UPDATE SET clientVersion = excluded.clientVersion
+         WHERE excluded.clientVersion > clientVersion",
+        &[text(group), text(client), text(hash), SqlValue::Text(client_version.to_string())],
+    )?;
+    Ok(())
+}
+
+pub fn remove_desire(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+    hash: &str,
+) -> Result<(), EngineError> {
+    db.exec(
+        "DELETE FROM _zsync_desires WHERE clientGroupID = ? AND clientID = ? AND hash = ?",
+        &[text(group), text(client), text(hash)],
+    )?;
+    Ok(())
+}
+
+// clear all of a client's desired queries (a desiredQueriesPatch 'clear')
+pub fn clear_desires(db: &mut dyn SyncDb, group: &str, client: &str) -> Result<(), EngineError> {
+    db.exec(
+        "DELETE FROM _zsync_desires WHERE clientGroupID = ? AND clientID = ?",
+        &[text(group), text(client)],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn delete_clients(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client_ids: &BTreeSet<String>,
+) -> Result<(), EngineError> {
+    if client_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", client_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params = Vec::with_capacity(client_ids.len() + 1);
+    params.push(text(group));
+    params.extend(client_ids.iter().map(text));
+    for table in [
+        "_zsync_desires",
+        "_zsync_query_ack",
+        "_zsync_query_transform_client",
+    ] {
+        db.exec(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE clientGroupID = ? AND clientID IN ({placeholders})"
+            ),
+            &params,
+        )?;
+    }
+    // a sibling can retire this client before its last push arrives. mutation
+    // order, deduplication and group ownership outlive its subscriptions.
+    Ok(())
+}
+
+// the hashes a client currently desires (for the gotQueries acknowledgement)
+pub(crate) fn desired_hashes(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+) -> Result<Vec<String>, EngineError> {
+    let rows = db.query(
+        "SELECT hash FROM _zsync_desires WHERE clientGroupID = ? AND clientID = ? ORDER BY hash",
+        &[text(group), text(client)],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| str_col(r.get("hash")).ok())
+        .collect())
+}
+
+// advance a client's acknowledged query-state version monotonically. called for
+// every applied desiredQueriesPatch (put/del/clear alike), so the ack tracks the
+// patch version independently of which desire rows currently exist and never
+// regresses when del/clear shrink the desire set (MEDIUM-6).
+pub(crate) fn advance_query_ack(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+    version: i64,
+) -> Result<(), EngineError> {
+    db.exec(
+        "INSERT INTO _zsync_query_ack (clientGroupID, clientID, version)
+         VALUES (?, ?, ?)
+         ON CONFLICT (clientGroupID, clientID) DO UPDATE SET version = excluded.version
+         WHERE excluded.version > version",
+        &[
+            text(group),
+            text(client),
+            SqlValue::Text(version.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+// the client's acknowledged query-state version: the monotonic value recorded by
+// advance_query_ack (0 if it has never sent a desiredQueriesPatch). read from the
+// durable ack row, NOT the max over current desires, so a del/clear cannot make
+// the gotQueries ack regress.
+pub(crate) fn client_query_version(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+) -> Result<i64, EngineError> {
+    let rows = db.query(
+        "SELECT CAST(version AS TEXT) AS v FROM _zsync_query_ack
+         WHERE clientGroupID = ? AND clientID = ?",
+        &[text(group), text(client)],
+    )?;
+    match rows.first().and_then(|r| r.get("v")) {
+        Some(SqlValue::Text(s)) => Ok(s.parse().unwrap_or(0)),
+        _ => Ok(0),
+    }
+}
+
+// Drop the cached membership of every client group that stopped pulling.
+//
+// The floor is the retained-ledger boundary: a cookie at or above it can be
+// served as a diff, one below it falls back to a full snapshot. A group that has
+// not pulled since the floor passed it will rebuild its whole set on its next
+// pull regardless, so its membership cache is dead weight.
+//
+// The liveness record lags. `touch_client_group` refreshes a group's seen
+// watermark only when it has fallen below the floor the pull is about to set,
+// so a group that pulled a moment ago can still carry a watermark up to one
+// retention window old. The floor is raised by whichever group pulls first, so
+// testing `seen >= floor` collected a live group whose turn came second: two
+// clients pulling in alternation lost one of them every window. Allowing one
+// window of lag makes the test exact again: a group last seen at or above
+// `floor - retain_changes` has pulled within the current window and keeps its
+// membership; one below it has not pulled for at least a full window.
+//
+// What is dropped is exactly what `reset_group` drops: the membership rows,
+// the reference counts, and the computed markers, which are the tables that
+// grow with history. What is kept is deliberate:
+//
+// - `_zsync_clients` holds lastMutationID, which is mutation dedup and must
+//   outlive the cache. It is four short columns per client and does not grow
+//   with history.
+// - `_zsync_desires` and `_zsync_queries` are what a returning group pulls
+//   with. A Zero client re-sends its queries only when it opens a connection;
+//   a pull that merely carries a below-floor cookie brings no patch. With the
+//   definitions gone that pull recomputed nothing, answered `clear`, and left
+//   every view empty until the page reloaded. Both tables are one short row
+//   per query, so retaining them costs nothing that grows with history.
+pub(crate) fn collect_abandoned_client_groups(
+    db: &mut dyn SyncDb,
+    floor: i64,
+    retain_changes: i64,
+) -> Result<(), EngineError> {
+    let bound = floor - retain_changes;
+    // pruning raises the floor on nearly every pull, and the deletes below
+    // scan every membership row. they can only remove something once a group
+    // has fallen behind the bound, so look for one first. membership with no
+    // seen row at all (orphaned by an older engine) goes with the next group
+    // that expires.
+    let expired = db.query(
+        "SELECT 1 FROM _zsync_client_group_seen WHERE watermark < ? LIMIT 1",
+        &[crate::store::counter(bound)],
+    )?;
+    if expired.is_empty() {
+        return Ok(());
+    }
+    // one predicate, applied to each table: a group is live iff it was seen
+    // within one retention window of the floor. A group with no seen row at
+    // all is caught by the same test, which is what collects membership
+    // orphaned by an older engine.
+    for table in ["_zsync_query_rows", "_zsync_row_refs", "_zsync_query_state"] {
+        db.exec(
+            &format!(
+                "DELETE FROM {table} WHERE clientGroupID NOT IN (
+                   SELECT clientGroupID FROM _zsync_client_group_seen WHERE watermark >= ?
+                 )"
+            ),
+            &[crate::store::counter(bound)],
+        )?;
+    }
+    db.exec(
+        "DELETE FROM _zsync_client_group_seen WHERE watermark < ?",
+        &[crate::store::counter(bound)],
+    )?;
+    Ok(())
+}
+
+// drop a group's entire durable membership + reference counts after a server
+// transform invalidates its authorization state.
+pub(crate) fn reset_group(db: &mut dyn SyncDb, group: &str) -> Result<(), EngineError> {
+    db.exec(
+        "DELETE FROM _zsync_query_rows WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    db.exec(
+        "DELETE FROM _zsync_row_refs WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    // clear the computed markers so a fresh re-sync recomputes every query
+    db.exec(
+        "DELETE FROM _zsync_query_state WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    Ok(())
+}
+
+// invalidate durable group state only when the server-owned group version
+// changes. the return value is narrower: this replica's local query state needs
+// a clear, including when a new client joins a group already on this version.
+pub(crate) fn prepare_transform_version(
+    db: &mut dyn SyncDb,
+    group: &str,
+    client: &str,
+    version: i64,
+) -> Result<bool, EngineError> {
+    let group_rows = db.query(
+        "SELECT CAST(version AS TEXT) AS v FROM _zsync_query_transform_group
+         WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    let group_version =
+        group_rows
+            .first()
+            .and_then(|row| row.get("v"))
+            .and_then(|value| match value {
+                SqlValue::Text(value) => value.parse::<i64>().ok(),
+                _ => None,
+            });
+
+    if group_version != Some(version) {
+        if group_version.is_some() {
+            // keep per-client desires until each client checks in so qpull can
+            // acknowledge targeted dels. a gotQueries clear drops Zero's local
+            // named-query mapping and leaves correctly returned rows invisible.
+            db.exec(
+                "DELETE FROM _zsync_queries WHERE clientGroupID = ?",
+                &[text(group)],
+            )?;
+            super::wake::forget_query(db, group, None)?;
+            reset_group(db, group)?;
+        }
+        db.exec(
+            "INSERT INTO _zsync_query_transform_group (clientGroupID, version) VALUES (?, ?)
+             ON CONFLICT (clientGroupID) DO UPDATE SET version = excluded.version",
+            &[text(group), SqlValue::Integer(version)],
+        )?;
+    }
+
+    let client_rows = db.query(
+        "SELECT CAST(version AS TEXT) AS v FROM _zsync_query_transform_client
+         WHERE clientGroupID = ? AND clientID = ?",
+        &[text(group), text(client)],
+    )?;
+    let client_version = client_rows
+        .first()
+        .and_then(|row| row.get("v"))
+        .and_then(|value| match value {
+            SqlValue::Text(value) => value.parse::<i64>().ok(),
+            _ => None,
+        });
+    let reset_client_store = client_version != Some(version);
+    if reset_client_store {
+        db.exec(
+            "INSERT INTO _zsync_query_transform_client (clientGroupID, clientID, version)
+             VALUES (?, ?, ?)
+             ON CONFLICT (clientGroupID, clientID) DO UPDATE SET version = excluded.version",
+            &[text(group), text(client), SqlValue::Integer(version)],
+        )?;
+    }
+    Ok(reset_client_store)
+}
+
+// canonicalize a change-log pk (json_object text) to the membership key form.
+// an unknown table has no spec to order by, so its rows are skipped rather than
+// keyed under a build-dependent encoding.
+pub(crate) fn canonical_pk_text(tables: &Tables, table: &str, pk_text: &str) -> Option<String> {
+    let spec = tables.get(table)?;
+    Some(crate::value::canonical_pk_text(spec, pk_text))
+}
+
+struct ActiveQuery {
+    hash: String,
+    // parsed once here: every pull used to re-parse each query's stored JSON
+    // two or three times (validate, recompute, narrow), which is pure CPU per
+    // long-poll on a many-query group.
+    ast: Ast,
+    root_table: String,
+    deps: Vec<String>,
+}
+
+// the distinct queries any client in the group currently desires, driven from
+// the queries table (one row per query) with an EXISTS probe per query into
+// desires. the old desires-driven JOIN walked every client's every desire
+// (clients x queries scanned per pull); the probe touches one index row per
+// query instead. _zsync_queries rows are unique by primary key, so no
+// DISTINCT is needed.
+fn active_queries(db: &mut dyn SyncDb, group: &str) -> Result<Vec<ActiveQuery>, EngineError> {
+    let rows = db.query(
+        "SELECT q.hash AS hash, q.ast AS ast, q.rootTable AS rootTable, q.deps AS deps
+         FROM _zsync_queries q
+         WHERE q.clientGroupID = ?
+           AND EXISTS (
+             SELECT 1 FROM _zsync_desires d
+             WHERE d.clientGroupID = q.clientGroupID AND d.hash = q.hash
+           )",
+        &[text(group)],
+    )?;
+    let mut out = Vec::new();
+    for row in &rows {
+        let hash = str_col(row.get("hash"))?;
+        let ast_text = str_col(row.get("ast"))?;
+        let root_table = str_col(row.get("rootTable"))?;
+        let deps: Vec<String> =
+            serde_json::from_str(&str_col(row.get("deps"))?).unwrap_or_default();
+        let ast_json: Value = serde_json::from_str(&ast_text)
+            .map_err(|e| EngineError::internal(format!("stored query ast is not json: {e}")))?;
+        let ast = parse_ast(&ast_json)?;
+        out.push(ActiveQuery {
+            hash,
+            ast,
+            root_table,
+            deps,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn validate_active_queries(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+) -> Result<(), EngineError> {
+    validate_queries(tables, &active_queries(db, group)?)
+}
+
+fn validate_queries(tables: &Tables, queries: &[ActiveQuery]) -> Result<(), EngineError> {
+    for query in queries {
+        super::opacity::validate_encrypted_column_usage(tables, &query.ast)?;
+    }
+    Ok(())
+}
+
+// the set of query hashes already computed at least once for the group
+fn read_query_state(db: &mut dyn SyncDb, group: &str) -> Result<BTreeSet<String>, EngineError> {
+    let rows = db.query(
+        "SELECT hash FROM _zsync_query_state WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| str_col(r.get("hash")).ok())
+        .collect())
+}
+
+fn set_query_state(db: &mut dyn SyncDb, group: &str, hash: &str) -> Result<(), EngineError> {
+    db.exec(
+        "INSERT OR IGNORE INTO _zsync_query_state (clientGroupID, hash) VALUES (?, ?)",
+        &[text(group), text(hash)],
+    )?;
+    Ok(())
+}
+
+fn str_col(v: Option<&SqlValue>) -> Result<String, EngineError> {
+    match v {
+        Some(SqlValue::Text(s)) => Ok(s.clone()),
+        _ => Err(EngineError::internal("expected a text column")),
+    }
+}
+
+// a query's durable member rows, as (rowTable, rowPk) keys (a query with
+// related output has members in more than one table)
+fn read_query_row_keys(
+    db: &mut dyn SyncDb,
+    group: &str,
+    hash: &str,
+) -> Result<BTreeSet<(String, String)>, EngineError> {
+    let rows = db.query(
+        "SELECT rowTable, rowPk FROM _zsync_query_rows WHERE clientGroupID = ? AND hash = ?",
+        &[text(group), text(hash)],
+    )?;
+    let mut out = BTreeSet::new();
+    for r in &rows {
+        if let (Ok(t), Ok(pk)) = (str_col(r.get("rowTable")), str_col(r.get("rowPk"))) {
+            out.insert((t, pk));
+        }
+    }
+    Ok(out)
+}
+
+// Is this row currently delivered to this client group?
+//
+// The authorization fact behind a realtime field subscription. It is the SAME
+// durable membership the group's transformed Zero queries produced, so a
+// subscriber can never reach a row its queries did not already authorize, and
+// no second permission language appears alongside Zero's.
+//
+// `pk` is the row's primary key as a JSON object; it is canonicalized here so a
+// caller may pass columns in any order (a realtime topic key arrives from a
+// client, where object key order is whatever the caller's literal used).
+//
+// A false answer is not necessarily a denial. During the optimistic-row race
+// the client legitimately holds a row from its own mutation that the server has
+// not recorded membership for yet, so a host answers that subscription pending
+// and the client retries after its next pull.
+pub fn row_membership(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    table: &str,
+    pk: &Value,
+) -> Result<bool, EngineError> {
+    let Some(spec) = tables.get(table) else {
+        return Ok(false);
+    };
+    let key = canonical_pk(spec, pk);
+    Ok(read_ref(db, group, table, &key)? > 0)
+}
+
+// Does this client group belong to this user? Checked before membership so a
+// caller cannot borrow another user's group id to read its rows.
+pub fn group_belongs_to_user(
+    db: &mut dyn SyncDb,
+    group: &str,
+    user_id: &str,
+) -> Result<bool, EngineError> {
+    let rows = db.query(
+        "SELECT DISTINCT userID FROM _zsync_clients WHERE clientGroupID = ?",
+        &[text(group)],
+    )?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    Ok(rows.iter().all(|row| match row.get("userID") {
+        Some(SqlValue::Text(owner)) => owner == user_id,
+        // a client row with no owner yet was claimed by this pull path already;
+        // treat it as unowned rather than as belonging to everyone
+        _ => false,
+    }))
+}
+
+fn read_ref(db: &mut dyn SyncDb, group: &str, table: &str, pk: &str) -> Result<i64, EngineError> {
+    let rows = db.query(
+        "SELECT CAST(refcount AS TEXT) AS c FROM _zsync_row_refs
+         WHERE clientGroupID = ? AND rowTable = ? AND rowPk = ?",
+        &[text(group), text(table), text(pk)],
+    )?;
+    match rows.first().and_then(|r| r.get("c")) {
+        Some(SqlValue::Text(s)) => Ok(s.parse().unwrap_or(0)),
+        _ => Ok(0),
+    }
+}
+
+// current refcounts for a set of (table, pk) keys in tiled row-value-IN
+// reads: one statement per ~49 keys instead of one point lookup per key.
+// missing keys read 0, exactly like read_ref.
+fn batch_read_refs(
+    db: &mut dyn SyncDb,
+    group: &str,
+    keys: &BTreeSet<(String, String)>,
+) -> Result<BTreeMap<(String, String), i64>, EngineError> {
+    let mut out: BTreeMap<(String, String), i64> = BTreeMap::new();
+    let ordered: Vec<&(String, String)> = keys.iter().collect();
+    for chunk in ordered.chunks((SQL_BIND_LIMIT - 1) / 2) {
+        let mut params = Vec::with_capacity(1 + chunk.len() * 2);
+        params.push(text(group));
+        for (table, pk) in chunk {
+            params.extend([text(table), text(pk)]);
+        }
+        for row in db.query(
+            &format!(
+                "SELECT rowTable, rowPk, CAST(refcount AS TEXT) AS c FROM _zsync_row_refs
+                 WHERE clientGroupID = ? AND (rowTable, rowPk) IN ({})",
+                vec!["(?, ?)"; chunk.len()].join(", "),
+            ),
+            &params,
+        )? {
+            let table = str_col(row.get("rowTable"))?;
+            let pk = str_col(row.get("rowPk"))?;
+            let count = match row.get("c") {
+                Some(SqlValue::Text(s)) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            out.insert((table, pk), count);
+        }
+    }
+    Ok(out)
+}
+
+// apply refcount changes, stamping membership transitions with the watermark
+// that observed them. positive -> 0 keeps the row as a tombstone carrying
+// removedVersion instead of deleting it, and 0 -> positive stamps addedVersion
+// (clearing any tombstone), so a later pull from another client of the group
+// can replay the transition against its own cookie. one multi-row upsert per
+// ~16 rows instead of a read plus a write per row; each entry is (table, pk,
+// new refcount, removedVersion-or-null). the caller never submits a row
+// staying non-positive (no row and no arrival, or a tombstone staying one):
+// writing one would corrupt tombstone replay.
+//
+// the CASEs derive the three outcomes from the conflicting row: a live row
+// keeps its addedVersion, a revived one takes the new addedVersion and clears
+// the tombstone, and a departure stamps removedVersion. a plain insert takes
+// the excluded row whole, which is always an arrival (a non-positive never
+// reaches an insert).
+fn batch_apply_refs(
+    db: &mut dyn SyncDb,
+    group: &str,
+    version: i64,
+    writes: &[(String, String, i64, Option<i64>)],
+) -> Result<(), EngineError> {
+    for chunk in writes.chunks(SQL_BIND_LIMIT / 6) {
+        let mut params = Vec::with_capacity(chunk.len() * 6);
+        for (table, pk, count, removed) in chunk {
+            params.extend([
+                text(group),
+                text(table),
+                text(pk),
+                SqlValue::Text(count.to_string()),
+                SqlValue::Integer(version),
+                match removed {
+                    Some(v) => SqlValue::Integer(*v),
+                    None => SqlValue::Null,
+                },
+            ]);
+        }
+        db.exec(
+            &format!(
+                "INSERT INTO _zsync_row_refs
+                   (clientGroupID, rowTable, rowPk, refcount, addedVersion, removedVersion)
+                 VALUES {}
+                 ON CONFLICT (clientGroupID, rowTable, rowPk) DO UPDATE SET
+                   refcount = excluded.refcount,
+                   addedVersion = CASE WHEN _zsync_row_refs.refcount <= 0
+                     THEN excluded.addedVersion ELSE _zsync_row_refs.addedVersion END,
+                   removedVersion = CASE WHEN excluded.refcount <= 0
+                     THEN excluded.removedVersion ELSE NULL END",
+                vec!["(?, ?, ?, ?, ?, ?)"; chunk.len()].join(", "),
+            ),
+            &params,
+        )?;
+    }
+    Ok(())
+}
+
+// the correlated subqueries whose rows a stock client needs to reproduce the
+// query locally: every related-OUTPUT subquery, plus every positive
+// correlated-EXISTS FILTER subquery. the client re-runs the whole query against
+// its synced rows, so it must have the member rows that make each EXISTS true;
+// without them its local EXISTS is false and the query collapses to empty.
+// NOT EXISTS is skipped: a matching parent has no matching child by definition,
+// so there are no rows to sync, and the client re-runs over the matching parent
+// set the server already sent.
+fn dependent_subqueries(ast: &Ast) -> Vec<&CorrelatedSubquery> {
+    let mut subs: Vec<&CorrelatedSubquery> = Vec::new();
+    if let Some(cond) = &ast.where_ {
+        collect_positive_exists(cond, &mut subs);
+    }
+    for rel in &ast.related {
+        subs.push(rel);
+    }
+    subs
+}
+
+fn collect_positive_exists<'a>(cond: &'a Condition, out: &mut Vec<&'a CorrelatedSubquery>) {
+    match cond {
+        Condition::Exists {
+            negated: false,
+            related,
+        } => out.push(related),
+        Condition::Exists { negated: true, .. } | Condition::Simple { .. } => {}
+        Condition::And(conds) | Condition::Or(conds) => {
+            for c in conds {
+                collect_positive_exists(c, out);
+            }
+        }
+    }
+}
+
+// walk a query's dependent subtree (related output + positive-EXISTS filter
+// subqueries), adding every correlated child (and grandchild, recursively) row
+// to the query's live member set. `parent_sql` is the compiled SQL of the
+// parent row-set at this level; each dependent subquery is joined to it and its
+// own SQL becomes the parent for the next level down.
+#[allow(clippy::too_many_arguments)]
+fn collect_dependent_rows(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    parent_sql: &str,
+    parent_params: &[SqlValue],
+    parent_table: &str,
+    ast: &Ast,
+    depth: usize,
+    live: &mut BTreeSet<(String, String)>,
+    values: &mut BTreeMap<(String, String), Row>,
+) -> Result<(), EngineError> {
+    for sub in dependent_subqueries(ast) {
+        let cr = compile_related_of(parent_sql, parent_params, parent_table, sub, tables, depth)?;
+        let child_spec = tables.get(&cr.child_table).ok_or_else(|| {
+            EngineError::internal(format!(
+                "dependent child table '{}' missing",
+                cr.child_table
+            ))
+        })?;
+        for row in db.query(&cr.sql, &cr.params)? {
+            let pk_obj = raw_pk(child_spec, &row);
+            let key = canonical_pk(child_spec, &pk_obj);
+            live.insert((cr.child_table.clone(), key.clone()));
+            values.insert((cr.child_table.clone(), key), row);
+        }
+        // the child row-set is the parent for the child's own dependent subqueries
+        collect_dependent_rows(
+            db,
+            tables,
+            &cr.sql,
+            &cr.params,
+            &cr.child_table,
+            &sub.subquery,
+            depth + 1,
+            live,
+            values,
+        )?;
+    }
+    Ok(())
+}
+
+// touched-pk narrowing, batched over every narrowable query at once: a pull
+// that missed another client's writes since its cookie must test each touched
+// row against each query on its table. per query that was two statements (a
+// membership check plus a predicate probe), so a 100-query group paid ~200
+// crossings to skip 99 queries. this resolves the same relevance for all of
+// them in a few statements: one DISTINCT-hash membership probe per root table
+// (grouped, since members are keyed by table), then one UNION ALL of tagged
+// EXISTS predicate probes for the queries no membership hit.
+//
+// relevance per query is unchanged: a touched row in a non-root dependency
+// table (an EXISTS/related child) is conservatively relevant (its effect on
+// parents is not cheaply localized). a touched ROOT row is relevant only if it
+// is a current member (it may leave or its data changed) or it matches the
+// query predicate (it may enter, possibly shifting a limited window). so a new
+// message in channel Y still probes as a non-member non-match for channel X's
+// query and is skipped. returns the hashes that must recompute.
+fn batched_relevance(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    candidates: &[&ActiveQuery],
+    changed: &BTreeSet<(String, String)>,
+) -> Result<BTreeSet<String>, EngineError> {
+    struct Pending<'a> {
+        hash: &'a str,
+        ast: &'a Ast,
+        root_table: &'a str,
+        root_pks: Vec<&'a String>,
+    }
+    let mut relevant = BTreeSet::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    for q in candidates {
+        let mut root_pks = Vec::new();
+        let mut early = false;
+        for (table, pk) in changed {
+            if !q.deps.iter().any(|d| d == table) {
+                continue;
+            }
+            if table != &q.root_table {
+                early = true; // non-root dependency change
+                break;
+            }
+            root_pks.push(pk);
+        }
+        if early {
+            relevant.insert(q.hash.clone());
+        } else if !root_pks.is_empty() {
+            pending.push(Pending {
+                hash: &q.hash,
+                ast: &q.ast,
+                root_table: &q.root_table,
+                root_pks,
+            });
+        }
+    }
+    if pending.is_empty() {
+        return Ok(relevant);
+    }
+    // phase 1: membership, grouped by root table. members are keyed
+    // (group, hash, table, pk), so one DISTINCT-hash statement per
+    // (table, hash-tile, key-tile) covers a whole group. tiles hold the bind
+    // count (group + table + hashes + keys) under the DO limit.
+    let mut by_table: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, p) in pending.iter().enumerate() {
+        by_table.entry(p.root_table).or_default().push(i);
+    }
+    for (table, idxs) in &by_table {
+        let mut keys: Vec<&String> = Vec::new();
+        let mut seen_keys: BTreeSet<&str> = BTreeSet::new();
+        let mut hashes: Vec<&str> = Vec::new();
+        for &i in idxs {
+            hashes.push(pending[i].hash);
+            for pk in &pending[i].root_pks {
+                if seen_keys.insert(pk.as_str()) {
+                    keys.push(pk);
+                }
+            }
+        }
+        // tile the (hash, key) matrix into <=100-bind cells (2 fixed binds
+        // for group and table): the small dim goes whole whenever it fits, so
+        // one query over many keys chunks exactly like the old per-query
+        // check, and many queries over few keys share one cell per ~97.
+        let budget = SQL_BIND_LIMIT - 2;
+        let (hc, kc) = if hashes.len() + keys.len() <= budget {
+            (hashes.len().max(1), keys.len().max(1))
+        } else if keys.len() <= budget / 2 {
+            (budget - keys.len(), keys.len())
+        } else if hashes.len() <= budget / 2 {
+            (hashes.len(), budget - hashes.len())
+        } else {
+            let hc = ((budget * hashes.len() + (hashes.len() + keys.len()) / 2)
+                / (hashes.len() + keys.len()))
+            .clamp(1, budget - 1);
+            (hc, budget - hc)
+        };
+        for key_chunk in keys.chunks(kc) {
+            for hash_chunk in hashes.chunks(hc) {
+                let mut params = vec![text(group), text(*table)];
+                params.extend(hash_chunk.iter().map(|h| text(*h)));
+                params.extend(key_chunk.iter().map(|pk| text(pk.as_str())));
+                let rows = db.query(
+                    &format!(
+                        "SELECT DISTINCT hash FROM _zsync_query_rows
+                         WHERE clientGroupID = ? AND rowTable = ?
+                           AND hash IN ({}) AND rowPk IN ({})",
+                        vec!["?"; hash_chunk.len()].join(", "),
+                        vec!["?"; key_chunk.len()].join(", "),
+                    ),
+                    &params,
+                )?;
+                for row in &rows {
+                    relevant.insert(str_col(row.get("hash"))?);
+                }
+            }
+        }
+    }
+    // phase 2: predicate probes for what membership missed, as one UNION ALL
+    // of tagged EXISTS branches per bind-budget statement. a branch is one
+    // query's probe over a key chunk; the tag travels as a bind (hashes are
+    // client-chosen, never interpolated). duplicate tags across a query's own
+    // chunks collapse in the set. statements are capped by bind count AND by
+    // union branch count: the DO compound-select limit is 5, far below what
+    // the bind budget alone would pack into one statement.
+    struct Branch {
+        sql: String,
+        params: Vec<SqlValue>,
+    }
+    let mut branches: Vec<Branch> = Vec::new();
+    for p in &pending {
+        if relevant.contains(p.hash) {
+            continue;
+        }
+        let probe = compile_predicate_probe(p.ast, tables)?;
+        // 1 tag bind + keys x pk columns + predicate binds <= limit
+        // (saturating: a giant predicate overflows the DO limit exactly as
+        // the old per-query probe did, never panics here).
+        let per_key = probe.primary_key.len().max(1);
+        let kb = (SQL_BIND_LIMIT.saturating_sub(1 + probe.params.len()) / per_key).max(1);
+        for key_chunk in p.root_pks.chunks(kb) {
+            let mut params = Vec::with_capacity(1 + key_chunk.len() * per_key + probe.params.len());
+            params.push(text(p.hash));
+            for pk in key_chunk {
+                let pk_obj: Value = serde_json::from_str(pk).unwrap_or(Value::Null);
+                for col in &probe.primary_key {
+                    params.push(json_pk_to_sql(pk_obj.get(col)));
+                }
+            }
+            params.extend(probe.params.iter().cloned());
+            branches.push(Branch {
+                sql: format!(
+                    "SELECT ? AS h WHERE EXISTS ({})",
+                    probe.sql(key_chunk.len())
+                ),
+                params,
+            });
+        }
+    }
+    let mut union_sql = String::new();
+    let mut union_params: Vec<SqlValue> = Vec::new();
+    let flush = |db: &mut dyn SyncDb,
+                 sql: &mut String,
+                 params: &mut Vec<SqlValue>,
+                 relevant: &mut BTreeSet<String>|
+     -> Result<(), EngineError> {
+        if sql.is_empty() {
+            return Ok(());
+        }
+        for row in db.query(sql, params)? {
+            relevant.insert(str_col(row.get("h"))?);
+        }
+        sql.clear();
+        params.clear();
+        Ok(())
+    };
+    let mut union_terms = 0usize;
+    for b in &branches {
+        if !union_sql.is_empty()
+            && (union_params.len() + b.params.len() > SQL_BIND_LIMIT
+                || union_terms >= SQL_COMPOUND_TERM_LIMIT)
+        {
+            flush(db, &mut union_sql, &mut union_params, &mut relevant)?;
+            union_terms = 0;
+        }
+        if !union_sql.is_empty() {
+            union_sql.push_str(" UNION ALL ");
+        }
+        union_sql.push_str(&b.sql);
+        union_params.extend(b.params.iter().cloned());
+        union_terms += 1;
+    }
+    flush(db, &mut union_sql, &mut union_params, &mut relevant)?;
+    Ok(relevant)
+}
+
+// recompute every active query for the group, diff each against durable
+// membership, net the per-row reference changes, and emit row puts (a row's
+// first reference in the group) and dels (its last reference gone). `changed`
+// carries the (table, pk) touched since the client's cookie so a row whose DATA
+// changed but whose membership did not is re-emitted with its current value.
+// direct-recompute entry for tests and tooling; handle_query_pull is the
+// production path. transitions stamped 0 replay to nobody, which is fine for a
+// caller that only reads the returned patch.
+pub fn recompute_group(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    changed: &BTreeSet<(String, String)>,
+) -> Result<Vec<Value>, EngineError> {
+    Ok(recompute_group_with_rehydrate(db, tables, group, changed, &BTreeSet::new(), false, 0)?.0)
+}
+
+// the rows patch plus the (table, pk) keys it already covers, so the pull's
+// transition replay never double-emits a row this recompute handled
+pub(crate) type MembershipDiff = (Vec<Value>, BTreeSet<(String, String)>);
+
+// the zero value of a live member row (a row `values` collected above).
+fn live_zero_row(tables: &Tables, table: &str, row: &Row) -> Result<Value, EngineError> {
+    let spec = tables
+        .get(table)
+        .ok_or_else(|| EngineError::internal(format!("member table '{table}' missing")))?;
+    zero_row(tables, table, spec, row)
+}
+
+pub(crate) fn recompute_group_with_rehydrate(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    changed: &BTreeSet<(String, String)>,
+    rehydrate: &BTreeSet<String>,
+    rehydrate_all: bool,
+    version: i64,
+) -> Result<MembershipDiff, EngineError> {
+    let queries = active_queries(db, group)?;
+    validate_queries(tables, &queries)?;
+
+    // clear computed markers for queries this group no longer desires, so a
+    // later re-desire recomputes from scratch instead of being narrowed away.
+    db.exec(
+        "DELETE FROM _zsync_query_state WHERE clientGroupID = ?
+         AND hash NOT IN (SELECT hash FROM _zsync_desires WHERE clientGroupID = ?)",
+        &[text(group), text(group)],
+    )?;
+
+    // recomputation narrowing (plan algorithm step 2): a query is recomputed only
+    // when the touched tables intersect its dependency set, or it has never been
+    // computed for this group (newly desired, or its AST changed and its marker
+    // was cleared). an untouched query's membership cannot have changed. the
+    // computed-marker set is loaded once so a skip costs no SQL.
+    let touched: BTreeSet<&str> = changed.iter().map(|(t, _)| t.as_str()).collect();
+    let mut computed: BTreeSet<String> = read_query_state(db, group)?;
+    // touched-pk narrowing, resolved once for every narrowable query: which
+    // computed, non-rehydrated, dependency-touched queries have a touched row
+    // that is a member or a predicate match. batched_relevance answers for all
+    // of them in a few statements instead of two per query.
+    let mut narrowable: BTreeSet<&str> = BTreeSet::new();
+    let mut narrow_candidates: Vec<&ActiveQuery> = Vec::new();
+    for q in &queries {
+        if computed.contains(&q.hash)
+            && !(rehydrate_all || rehydrate.contains(&q.hash))
+            && q.deps.iter().any(|t| touched.contains(t.as_str()))
+        {
+            narrowable.insert(q.hash.as_str());
+            narrow_candidates.push(q);
+        }
+    }
+    let relevant = batched_relevance(db, tables, group, &narrow_candidates, changed)?;
+
+    // net reference delta per (table, pk), and the live rows for puts. rows stay
+    // raw until one is emitted: a steady recompute re-reads every member but
+    // emits few, and converting each member to its zero value up front was most
+    // of a busy group's pull time.
+    let mut ref_delta: BTreeMap<(String, String), i64> = BTreeMap::new();
+    let mut values: BTreeMap<(String, String), Row> = BTreeMap::new();
+    let mut rehydrate_rows: BTreeSet<(String, String)> = BTreeSet::new();
+    // membership rows to write, applied batched below: one multi-row INSERT
+    // per ~25 arrivals and one row-value-IN DELETE per ~32 departures instead
+    // of one statement per row.
+    let mut arrivals: Vec<(String, String, String)> = Vec::new();
+    let mut departures: Vec<(String, String, String)> = Vec::new();
+
+    for q in &queries {
+        let rehydrate_query = rehydrate_all || rehydrate.contains(&q.hash);
+        if computed.contains(&q.hash) && !rehydrate_query {
+            // (a) dependency-intersection and (b) touched-pk narrowing, both
+            // resolved above: skip unless a touched row can affect this query.
+            if !narrowable.contains(q.hash.as_str()) || !relevant.contains(&q.hash) {
+                continue;
+            }
+        } else if computed.insert(q.hash.clone()) {
+            // never computed for this group (newly desired, or AST changed): compute
+            set_query_state(db, group, &q.hash)?;
+        }
+        let spec = tables.get(&q.root_table).ok_or_else(|| {
+            EngineError::internal(format!("query root table '{}' missing", q.root_table))
+        })?;
+        let ast = &q.ast;
+
+        // the query's live members = root rows + related-output child rows, keyed
+        // by (table, pk). collecting into one set lets the diff/refcount logic
+        // treat every member uniformly regardless of which table it came from.
+        let mut live: BTreeSet<(String, String)> = BTreeSet::new();
+
+        let compiled = compile(ast, tables)?;
+        for row in db.query(&compiled.sql, &compiled.params)? {
+            let pk_obj = raw_pk(spec, &row);
+            let key = canonical_pk(spec, &pk_obj);
+            live.insert((q.root_table.clone(), key.clone()));
+            values.insert((q.root_table.clone(), key), row);
+        }
+
+        // dependent rows (related output + positive-EXISTS filter subqueries),
+        // walked recursively. a parent membership change re-runs these joins, so
+        // children follow their parents even when the child table was untouched.
+        // syncing the EXISTS-filter rows is what lets the stock client re-run the
+        // query locally and reproduce the server's membership.
+        collect_dependent_rows(
+            db,
+            tables,
+            &compiled.sql,
+            &compiled.params,
+            &ast.table,
+            ast,
+            0,
+            &mut live,
+            &mut values,
+        )?;
+
+        if rehydrate_query {
+            rehydrate_rows.extend(live.iter().cloned());
+        }
+
+        let durable = read_query_row_keys(db, group, &q.hash)?;
+        for key in live.difference(&durable) {
+            arrivals.push((q.hash.clone(), key.0.clone(), key.1.clone()));
+            *ref_delta.entry(key.clone()).or_insert(0) += 1;
+        }
+        for key in durable.difference(&live) {
+            departures.push((q.hash.clone(), key.0.clone(), key.1.clone()));
+            *ref_delta.entry(key.clone()).or_insert(0) -= 1;
+        }
+    }
+
+    // deactivated queries: a query no client desires any more still has durable
+    // membership rows. drop them and release their references (invariant 15:
+    // dropping a desired query removes its rows unless another query holds them).
+    // find just the deactivated hashes first, so a recompute with no deactivation
+    // never scans the whole membership.
+    //
+    // the candidate set comes from _zsync_queries (one row per registered query)
+    // rather than _zsync_query_rows (one row per row in every query's result).
+    // it is a guaranteed superset: membership rows are only ever written for a
+    // hash in active_queries (_zsync_desires JOIN _zsync_queries), and the one
+    // DELETE of a group's _zsync_queries is immediately followed by reset_group,
+    // which drops that group's membership too -- so a hash can never keep rows
+    // after leaving _zsync_queries. a candidate with no rows costs one empty
+    // index lookup in the loop below.
+    //
+    // reading it from _zsync_query_rows made this probe visit every membership
+    // row in the group on EVERY recompute (measured: 10,000 rows read to yield
+    // 10 hashes at 10 queries x 1,000 rows), which is the opposite of what the
+    // comment above promises. _zsync_query_state is NOT usable here: the
+    // DELETE at the top of this function has already cleared exactly these
+    // hashes' markers, and rows orphaned by an AST change have no marker at all.
+    let deactivated: Vec<String> = db
+        .query(
+            "SELECT hash FROM _zsync_queries WHERE clientGroupID = ?
+             AND hash NOT IN (SELECT hash FROM _zsync_desires WHERE clientGroupID = ?)",
+            &[text(group), text(group)],
+        )?
+        .iter()
+        .filter_map(|r| str_col(r.get("hash")).ok())
+        .collect();
+    for hash in &deactivated {
+        let rows = read_query_row_keys(db, group, hash)?;
+        for (table, pk) in rows {
+            departures.push((hash.clone(), table.clone(), pk.clone()));
+            *ref_delta.entry((table, pk)).or_insert(0) -= 1;
+        }
+        // The definition is derived from a client's put operation. Once the
+        // last desire is gone, retaining it only makes every later recompute
+        // revisit a query that cannot produce membership. A future put calls
+        // register_query before restoring the desire, so it recreates the
+        // definition through the same path as a new query.
+        db.exec(
+            "DELETE FROM _zsync_queries WHERE clientGroupID = ? AND hash = ?",
+            &[text(group), text(hash)],
+        )?;
+        super::wake::forget_query(db, group, Some(hash))?;
+    }
+
+    // apply the collected membership writes batched: multi-row INSERT OR
+    // IGNORE for arrivals, one row-value-IN DELETE per tile for departures.
+    // set effects are identical to the old one-row-per-statement loop (same
+    // rows, same IGNORE/conflict behavior); only the statement count changes.
+    for chunk in arrivals.chunks(SQL_BIND_LIMIT / 4) {
+        let mut params = Vec::with_capacity(chunk.len() * 4);
+        for (hash, table, pk) in chunk {
+            params.extend([text(group), text(hash), text(table), text(pk)]);
+        }
+        db.exec(
+            &format!(
+                "INSERT OR IGNORE INTO _zsync_query_rows (clientGroupID, hash, rowTable, rowPk)
+                 VALUES {}",
+                vec!["(?, ?, ?, ?)"; chunk.len()].join(", "),
+            ),
+            &params,
+        )?;
+    }
+    for chunk in departures.chunks((SQL_BIND_LIMIT - 1) / 3) {
+        let mut params = Vec::with_capacity(1 + chunk.len() * 3);
+        params.push(text(group));
+        for (hash, table, pk) in chunk {
+            params.extend([text(hash), text(table), text(pk)]);
+        }
+        db.exec(
+            &format!(
+                "DELETE FROM _zsync_query_rows
+                 WHERE clientGroupID = ? AND (hash, rowTable, rowPk) IN ({})",
+                vec!["(?, ?, ?)"; chunk.len()].join(", "),
+            ),
+            &params,
+        )?;
+    }
+
+    // apply net deltas; emit a put on 0 -> positive, a del on positive -> 0.
+    // transitions are stamped with the caller's watermark so other clients of
+    // the group replay them from their own cookies (see _zsync_row_refs).
+    // current refcounts arrive in one row-value-IN read per tile (plus the
+    // changed-but-live keys the re-emit below needs), and the writes go out as
+    // one multi-row upsert per tile instead of a read plus a write per row.
+    let mut ref_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    for (key, delta) in &ref_delta {
+        if *delta != 0 {
+            ref_keys.insert(key.clone());
+        }
+    }
+    for (table, pk) in changed {
+        let key = (table.clone(), pk.clone());
+        if values.contains_key(&key) {
+            ref_keys.insert(key);
+        }
+    }
+    let olds = batch_read_refs(db, group, &ref_keys)?;
+    // (table, pk, new refcount, removedVersion-or-null): rows whose write the
+    // old code skipped (no row and no arrival, or a tombstone staying one)
+    // never enter this list, exactly as before.
+    let mut ref_writes: Vec<(String, String, i64, Option<i64>)> = Vec::new();
+    let mut patch: Vec<Value> = Vec::new();
+    let mut emitted: BTreeSet<(String, String)> = BTreeSet::new();
+    for ((table, pk), delta) in &ref_delta {
+        if *delta == 0 {
+            continue;
+        }
+        let old = olds.get(&(table.clone(), pk.clone())).copied().unwrap_or(0);
+        let new = old + delta;
+        // a write here must never touch a row staying non-positive: the old
+        // code skipped it (no row and no arrival, or a tombstone staying one),
+        // and writing would corrupt tombstone replay (see batch_apply_refs).
+        if old <= 0 && new <= 0 {
+            continue;
+        }
+        ref_writes.push((
+            table.clone(),
+            pk.clone(),
+            new,
+            if new <= 0 { Some(version) } else { None },
+        ));
+        if old == 0 && new > 0 {
+            let row = values
+                .remove(&(table.clone(), pk.clone()))
+                .ok_or_else(|| EngineError::internal("added row missing live value"))?;
+            let value = live_zero_row(tables, table, &row)?;
+            let physical_table = tables
+                .physical_name(table)
+                .expect("member table has physical mapping");
+            patch.push(json!({ "op": "put", "tableName": physical_table, "value": value }));
+            emitted.insert((table.clone(), pk.clone()));
+        } else if old > 0 && new == 0 {
+            let spec = tables.get(table).unwrap();
+            let pk_obj: Value = serde_json::from_str(pk).unwrap_or(Value::Null);
+            let physical_table = tables
+                .physical_name(table)
+                .expect("member table has physical mapping");
+            patch.push(json!({
+                "op": "del",
+                "tableName": physical_table,
+                "id": zero_pk_id(tables, table, spec, &pk_obj)?,
+            }));
+            emitted.insert((table.clone(), pk.clone()));
+        }
+    }
+    // one multi-row upsert per tile for the refcount writes above. runs after
+    // the emit decisions (which only need olds) and before everything below
+    // that reads refs back (re-emit is decided from olds, transitions replay
+    // from the durable rows this writes).
+    batch_apply_refs(db, group, version, &ref_writes)?;
+
+    // re-emit rows whose data changed but whose membership did not (still
+    // referenced, without duplicating a put/del from a membership flip). only a
+    // recomputed query holds a live value, so the refcount read is skipped for
+    // every changed row no recompute reached, which on a narrowed pull is all.
+    // decided from the pre-update olds: a key this pull emitted is skipped
+    // above, and every other key's refcount is untouched by this pull, so the
+    // pre-update value answers identically to a fresh read.
+    for (table, pk) in changed {
+        let key = (table.clone(), pk.clone());
+        if emitted.contains(&key) || !values.contains_key(&key) {
+            continue;
+        }
+        if olds.get(&key).copied().unwrap_or(0) > 0
+            && let Some(row) = values.remove(&key)
+        {
+            let value = live_zero_row(tables, table, &row)?;
+            let physical_table = tables
+                .physical_name(table)
+                .expect("member table has physical mapping");
+            patch.push(json!({ "op": "put", "tableName": physical_table, "value": value }));
+            emitted.insert(key);
+        }
+    }
+
+    // a newly-desiring client in an existing group may have an empty local
+    // cache even though the group's durable membership and cookie are current
+    // (for example after a ttl=0 client restart). membership refcounts do not
+    // change, but that client still needs the live rows for its query. duplicate
+    // puts are idempotent in the shared client-group store.
+    for key in rehydrate_rows {
+        if emitted.contains(&key) {
+            continue;
+        }
+        let row = values
+            .remove(&key)
+            .ok_or_else(|| EngineError::internal("rehydrated row missing live value"))?;
+        let value = live_zero_row(tables, &key.0, &row)?;
+        let physical_table = tables
+            .physical_name(&key.0)
+            .expect("member table has physical mapping");
+        patch.push(json!({ "op": "put", "tableName": physical_table, "value": value }));
+        emitted.insert(key);
+    }
+
+    Ok((patch, emitted))
+}
+
+// membership transitions the group recorded after `cookie`, for a client whose
+// replica predates them. a recompute writes each transition durably ONCE (the
+// pull that observed it), so a second client of the same group pulling from an
+// older cookie finds an already-settled membership and an empty diff — without
+// this replay its cookie would advance past a departure it never received and
+// the row would ghost in its replica forever. `skip` carries the keys the
+// current response already emits. cost: one primary-key-prefix scan of the
+// group's refs per non-full pull; a put re-reads the live row by pk.
+pub(crate) fn transitions_since(
+    db: &mut dyn SyncDb,
+    tables: &Tables,
+    group: &str,
+    cookie: i64,
+    skip: &BTreeSet<(String, String)>,
+) -> Result<Vec<Value>, EngineError> {
+    let rows = db.query(
+        "SELECT rowTable, rowPk, CAST(refcount AS TEXT) AS c FROM _zsync_row_refs
+         WHERE clientGroupID = ?
+           AND (addedVersion > ? OR (refcount = 0 AND removedVersion > ?))",
+        &[
+            text(group),
+            SqlValue::Integer(cookie),
+            SqlValue::Integer(cookie),
+        ],
+    )?;
+    // pass 1, in transition order: emit dels inline, stage live re-reads.
+    // pass 2 replays the staged puts in that same order from one IN query
+    // per (table, key-tile) instead of one point lookup per row.
+    enum Staged {
+        Del(Value),
+        Live { table: String, pk: String },
+    }
+    let mut ops: Vec<Staged> = Vec::new();
+    let mut live_by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let table = str_col(row.get("rowTable"))?;
+        let pk = str_col(row.get("rowPk"))?;
+        if skip.contains(&(table.clone(), pk.clone())) {
+            continue;
+        }
+        let live = match row.get("c") {
+            Some(SqlValue::Text(s)) => s.parse::<i64>().unwrap_or(0) > 0,
+            _ => false,
+        };
+        let spec = tables
+            .get(&table)
+            .ok_or_else(|| EngineError::internal(format!("member table '{table}' missing")))?;
+        let physical_table = tables
+            .physical_name(&table)
+            .expect("member table has physical mapping");
+        let pk_obj: Value = serde_json::from_str(&pk).unwrap_or(Value::Null);
+        if live {
+            live_by_table
+                .entry(table.clone())
+                .or_default()
+                .push(pk.clone());
+            ops.push(Staged::Live { table, pk });
+        } else {
+            ops.push(Staged::Del(json!({
+                "op": "del",
+                "tableName": physical_table,
+                "id": zero_pk_id(tables, &table, spec, &pk_obj)?,
+            })));
+        }
+    }
+    // live rows by (table, pk): the refs carry canonical keys, so the map is
+    // keyed by the same text the staged ops hold.
+    let mut live_rows: BTreeMap<(String, String), Row> = BTreeMap::new();
+    for (table, pks) in &live_by_table {
+        let spec = tables
+            .get(table)
+            .ok_or_else(|| EngineError::internal(format!("member table '{table}' missing")))?;
+        let physical_table = tables
+            .physical_name(table)
+            .expect("member table has physical mapping");
+        let pk_cols = &spec.primary_key;
+        for pk_chunk in pks.chunks((SQL_BIND_LIMIT / pk_cols.len().max(1)).max(1)) {
+            let mut params = Vec::with_capacity(pk_chunk.len() * pk_cols.len());
+            let mut holes: Vec<String> = Vec::with_capacity(pk_chunk.len());
+            for pk in pk_chunk {
+                let pk_obj: Value = serde_json::from_str(pk).unwrap_or(Value::Null);
+                let mut row_holes = Vec::with_capacity(pk_cols.len());
+                for col in pk_cols {
+                    params.push(json_pk_to_sql(pk_obj.get(col)));
+                    row_holes.push("?");
+                }
+                holes.push(format!("({})", row_holes.join(", ")));
+            }
+            let predicate = if pk_cols.len() == 1 {
+                format!("\"{}\" IN ({})", pk_cols[0], holes.join(", "))
+            } else {
+                format!(
+                    "({}) IN ({})",
+                    pk_cols
+                        .iter()
+                        .map(|col| format!("\"{col}\""))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    holes.join(", "),
+                )
+            };
+            let sql = format!("SELECT * FROM \"{physical_table}\" WHERE {predicate}");
+            for app_row in db.query(&sql, &params)? {
+                let pk_obj = raw_pk(spec, &app_row);
+                live_rows.insert((table.clone(), canonical_pk(spec, &pk_obj)), app_row);
+            }
+        }
+    }
+    let mut patch = Vec::new();
+    for op in ops {
+        match op {
+            Staged::Del(value) => patch.push(value),
+            Staged::Live { table, pk } => {
+                let Some(app_row) = live_rows.remove(&(table.clone(), pk.clone())) else {
+                    // membership says live but the row is gone: the departure
+                    // will settle on the next recompute; skip rather than
+                    // invent state.
+                    continue;
+                };
+                let spec = tables.get(&table).ok_or_else(|| {
+                    EngineError::internal(format!("member table '{table}' missing"))
+                })?;
+                let physical_table = tables
+                    .physical_name(&table)
+                    .expect("member table has physical mapping");
+                patch.push(json!({
+                    "op": "put",
+                    "tableName": physical_table,
+                    "value": zero_row(tables, &table, spec, &app_row)?,
+                }));
+            }
+        }
+    }
+    Ok(patch)
+}
+
+// tombstones no client can need any more: a cookie at or below the retain
+// floor gets a full response, so a departure stamped at or below it will never
+// be asked for again.
+pub(crate) fn prune_tombstones(db: &mut dyn SyncDb, floor: i64) -> Result<(), EngineError> {
+    db.exec(
+        "DELETE FROM _zsync_row_refs WHERE refcount = 0 AND removedVersion <= ?",
+        &[SqlValue::Integer(floor)],
+    )?;
+    Ok(())
+}

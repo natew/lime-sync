@@ -1,0 +1,379 @@
+import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+import { findPort } from '../../src/port.ts'
+import { defineCloudflareConfig } from './src/cf-deploy/config.ts'
+import { buildMigrationModuleSource } from './src/cf-deploy/migration.ts'
+
+const fixture = mkdtempSync(join(import.meta.dirname, '.migration-workerd-'))
+const port = await findPort(0)
+const inspectorPort = await findPort(0)
+
+writeFileSync(
+  join(fixture, 'schema.ts'),
+  'export const schema = { tables: {}, relationships: {} }\n'
+)
+writeFileSync(
+  join(fixture, 'migration.ts'),
+  buildMigrationModuleSource(defineCloudflareConfig('contrast'), {
+    mode: 'native',
+    schemaVersion: 'migration-cost-v1',
+    schemaImportSpecifier: './schema.js',
+    nativeSqlStatements: [
+      ...Array.from({ length: 588 - 3 }, (_, index) => ({
+        id: `0000_history/migration.sql:${index}`,
+        sql: '-- historical statement retained for migration identity',
+      })),
+      {
+        id: '0001_retired/migration.sql:0',
+        sql: 'DROP TABLE IF EXISTS retired',
+      },
+      {
+        id: '0002_alpha/migration.sql:0',
+        sql: 'CREATE TABLE alpha (id TEXT PRIMARY KEY)',
+      },
+      {
+        id: '0003_beta/migration.sql:0',
+        sql: 'CREATE TABLE beta (id TEXT PRIMARY KEY)',
+      },
+    ],
+    expectedTables: [
+      {
+        name: 'alpha',
+        columns: [{ name: 'id', notNull: true, primaryKeyOrder: 1, sqlType: 'text' }],
+      },
+      {
+        name: 'beta',
+        columns: [{ name: 'id', notNull: true, primaryKeyOrder: 1, sqlType: 'text' }],
+      },
+    ],
+  })
+)
+writeFileSync(
+  join(fixture, 'worker.ts'),
+  `import { createOrezDataWorker } from '../src/cf-do/lite-data-worker.js'
+import { orezAppSchema } from './migration.js'
+
+const notificationAttempts = new Map<string, number>()
+const dataWorker = createOrezDataWorker({
+  name: 'contrast',
+  schema: orezAppSchema,
+  applicationSqlDidCommit({ instance }) {
+    notificationAttempts.set(instance, (notificationAttempts.get(instance) ?? 0) + 1)
+  },
+})
+
+export class ZeroDO extends dataWorker.ZeroDO {
+  resetForProof() { this.ctx.abort('snapshot restart proof') }
+  async checkCurrentSchema(instance) {
+    return orezAppSchema.migrate({ instance, client: this.applicationSqlLocalClient(instance) })
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url)
+    const [action, namespace] = url.pathname.slice(1).split('/')
+    if (!namespace) return new Response('missing namespace', { status: 400 })
+    const instance = namespace.startsWith('ns:') ? namespace : 'ns:' + namespace
+    if (action === 'backup-proof') {
+      const client = dataWorker.applicationSqlClient(env, namespace)
+      const stub = env.ZERO_SQL_DO.get(env.ZERO_SQL_DO.idFromName(instance))
+      await client.exec('CREATE TABLE payload (id INTEGER PRIMARY KEY, body TEXT)')
+      await client.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8192) INSERT INTO payload SELECT i, printf('%4096s', 'x') FROM n")
+      const markerQuery = 'SELECT write_seq FROM _orez_backup_meta WHERE id = 1'
+      const beforeMarker = await client.query(markerQuery)
+      const budget = () => stub.fetch(new Request('https://fixture.invalid/_orez/write-budget')).then(r => r.json())
+      const before = await budget()
+      const started = performance.now()
+      const snapshot = await env.ZERO_SQL_DO.get(env.ZERO_SQL_DO.idFromName(instance)).backupSnapshot({ markerTable: '_orez_backup_meta', excludedTables: ['_orez_backup_meta'] })
+      const copyMs = performance.now() - started
+      const after = await budget()
+      const afterMarker = await client.query(markerQuery)
+      await client.exec("UPDATE payload SET body = 'changed' WHERE id = 1")
+      const copied = await client.query('SELECT count(*) AS rows, sum(length(c1)) AS bytes FROM "_orez_bk_' + snapshot.id + '_payload"')
+      const triggers = await client.query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name GLOB '_orez_bk_*_payload'")
+      await stub.backupSnapshotDrop(snapshot.id)
+      snapshot.lease[Symbol.dispose]()
+      const dropped = await client.query("SELECT name FROM sqlite_master WHERE name GLOB '_orez_bk_*'")
+      const abandoned = await stub.backupSnapshot({ markerTable: '_orez_backup_meta', excludedTables: ['_orez_backup_meta'] })
+      abandoned.lease[Symbol.dispose]()
+      let residue = []
+      const disposalDeadline = Date.now() + 5000
+      do {
+        residue = await client.query("SELECT name FROM sqlite_master WHERE name GLOB '_orez_bk_*'")
+        if (!residue.length) break
+        await new Promise(resolve => setTimeout(resolve, 10))
+      } while (Date.now() < disposalDeadline)
+      if (residue.length) throw new Error('disposed backup lease left snapshot tables behind')
+      const old = await stub.backupSnapshot({ markerTable: '_orez_backup_meta', excludedTables: ['_orez_backup_meta'] })
+      try { await stub.resetForProof() } catch {}
+      const fresh = env.ZERO_SQL_DO.get(env.ZERO_SQL_DO.idFromName(instance))
+      const freshClient = dataWorker.applicationSqlClient(env, namespace)
+      const newer = await fresh.backupSnapshot({ markerTable: '_orez_backup_meta', excludedTables: ['_orez_backup_meta'] })
+      if (old.id === newer.id) throw new Error('restart reused a snapshot identity')
+      let oldReadRejected = false
+      try { await freshClient.query('SELECT * FROM "_orez_bk_' + old.id + '_payload" LIMIT 1') } catch (error) {
+        if (!String(error).includes('no such table: _orez_bk_' + old.id + '_payload')) throw error
+        oldReadRejected = true
+      }
+      if (!oldReadRejected) throw new Error('old snapshot read survived restart')
+      await fresh.backupSnapshotDrop(old.id)
+      const newerRows = await freshClient.query('SELECT count(*) AS rows FROM "_orez_bk_' + newer.id + '_payload"')
+      if (newerRows[0].rows !== 8192) throw new Error('old cleanup removed the new snapshot')
+      await fresh.backupSnapshotDrop(newer.id)
+      try { old.lease[Symbol.dispose]() } catch {}
+      newer.lease[Symbol.dispose]()
+
+      // a restore import is namespace maintenance like the export copy: its
+      // rows never meter, and a tripped circuit stops application writes but
+      // not the restore that recovers the object.
+      const freshBudget = () => fresh.fetch(new Request('https://fixture.invalid/_orez/write-budget')).then(r => r.json())
+      const admin = { 'x-orez-admin-token': env.OREZ_DO_WRITE_BUDGET_ADMIN_TOKEN }
+      const importBefore = await freshBudget()
+      await fresh.orezImportBatch([
+        { sql: 'CREATE TABLE imported (id INTEGER PRIMARY KEY, body TEXT)' },
+        { sql: "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2048) INSERT INTO imported SELECT i, 'restored' FROM n" },
+      ])
+      const importAfter = await freshBudget()
+      const trip = await fresh.fetch(new Request('https://fixture.invalid/_orez/write-budget/trip', { method: 'POST', headers: admin }))
+      if (!trip.ok) throw new Error('force trip failed: ' + trip.status)
+      await fresh.orezImportBatch([{ sql: "INSERT INTO imported (id, body) VALUES (0, 'restored while tripped')" }])
+      let trippedApplicationWrite = null
+      try { await freshClient.exec("INSERT INTO imported (id, body) VALUES (-1, 'application')") } catch (error) { trippedApplicationWrite = String(error) }
+      const reopen = await fresh.fetch(new Request('https://fixture.invalid/_orez/write-budget/reopen', { method: 'POST', headers: admin }))
+      if (!reopen.ok) throw new Error('reopen failed: ' + reopen.status)
+      const imported = await freshClient.query('SELECT count(*) AS rows FROM imported')
+
+      return Response.json({ copyMs, beforeMarker, afterMarker, before, after, copied, triggers, dropped, importBefore, importAfter, trippedApplicationWrite, imported })
+    }
+    if (action === 'seed') {
+      // a namespace with ledger history but no reconciled schema. application
+      // sql over rpc would converge the schema first, so the history lands the
+      // way a restore does: straight into the object, past that check.
+      const stub = env.ZERO_SQL_DO.get(env.ZERO_SQL_DO.idFromName(instance))
+      await stub.orezImportBatch([
+        {
+          sql: 'CREATE TABLE IF NOT EXISTS "__contrast_cf_migrations" (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)',
+        },
+        {
+          sql: 'INSERT INTO "__contrast_cf_migrations" (id, applied_at) VALUES (?, ?)',
+          params: ['0001_retired/migration.sql:0:previous-hash', 1],
+        },
+        ...Array.from({ length: 1000 }, (_, index) => ({
+          sql: 'INSERT INTO "__contrast_cf_migrations" (id, applied_at) VALUES (?, ?)',
+          params: ['historical-' + String(index).padStart(4, '0') + ':hash', 1],
+        })),
+      ])
+      notificationAttempts.set(instance, 0)
+      return Response.json({ ok: true })
+    }
+    if (action === 'first-touch') {
+      // a never-reconciled namespace reached only by raw application sql
+      const client = dataWorker.applicationSqlClient(env, namespace)
+      return Response.json(
+        await client.query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('alpha', 'beta') ORDER BY name"
+        )
+      )
+    }
+    if (action === 'migrate') {
+      const result = await dataWorker.ensureNamespaceSchema(env, namespace, { force: true })
+      return Response.json(result)
+    }
+    if (action === 'current-check') {
+      const stub = env.ZERO_SQL_DO.get(env.ZERO_SQL_DO.idFromName(instance))
+      return Response.json(await stub.checkCurrentSchema(instance))
+    }
+    if (action === 'status') {
+      return dataWorker.fetch(
+        new Request('https://fixture.invalid/' + namespace + '/_orez/status', {
+          headers: { 'x-orez-admin-token': 'migration-cost-admin' },
+        }),
+        env,
+        ctx
+      )
+    }
+    if (action === 'observe') {
+      const client = dataWorker.applicationSqlClient(env, namespace)
+      const [tables, ledger] = await Promise.all([
+        client.query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('alpha', 'beta') ORDER BY name"
+        ),
+        client.query('SELECT COUNT(*) AS count FROM "__contrast_cf_migrations"'),
+      ])
+      return Response.json({
+        tables,
+        ledger: Number(ledger[0]?.count ?? 0),
+        callbacks: notificationAttempts.get(instance) ?? 0,
+      })
+    }
+    return new Response('not found', { status: 404 })
+  },
+}
+`
+)
+writeFileSync(
+  join(fixture, 'wrangler.toml'),
+  `name = "orez-migration-cost"
+main = "worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+OREZ_DO_WRITE_BUDGET_ADMIN_TOKEN = "migration-cost-admin"
+
+[[durable_objects.bindings]]
+name = "ZERO_SQL_DO"
+class_name = "ZeroDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ZeroDO"]
+`
+)
+
+const server = Bun.spawn(
+  [
+    'bunx',
+    'wrangler',
+    'dev',
+    '--config',
+    'wrangler.toml',
+    '--local',
+    '--port',
+    String(port),
+    '--inspector-port',
+    String(inspectorPort),
+  ],
+  { cwd: fixture, stdout: 'inherit', stderr: 'inherit' }
+)
+const base = `http://127.0.0.1:${port}`
+
+try {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fetch(`${base}/missing/readiness`)
+      break
+    } catch {}
+    if (server.exitCode !== null) {
+      throw new Error(`migration workerd fixture exited with ${server.exitCode}`)
+    }
+    if (attempt >= 200) throw new Error('migration workerd fixture did not become ready')
+    await Bun.sleep(100)
+  }
+
+  const namespace = `proj-ledger-cost-${crypto.randomUUID()}`
+  assert.equal((await fetch(`${base}/seed/${namespace}`, { method: 'POST' })).status, 200)
+  const before = await fetch(`${base}/status/${namespace}`).then((response) =>
+    response.json()
+  )
+  assert.equal(
+    (await fetch(`${base}/migrate/${namespace}`, { method: 'POST' })).status,
+    200
+  )
+  const after = await fetch(`${base}/status/${namespace}`).then((response) =>
+    response.json()
+  )
+  const observation = await fetch(`${base}/observe/${namespace}`).then((response) =>
+    response.json()
+  )
+  const cost = {
+    rowsRead: after.sqlBillingSinceBoot.rowsRead - before.sqlBillingSinceBoot.rowsRead,
+    rowsWritten:
+      after.sqlBillingSinceBoot.rowsWritten - before.sqlBillingSinceBoot.rowsWritten,
+    sessions:
+      after.requestsSinceBoot.applicationSqlSessions -
+      before.requestsSinceBoot.applicationSqlSessions,
+    readSessions:
+      after.requestsSinceBoot.applicationSqlReadSessions -
+      before.requestsSinceBoot.applicationSqlReadSessions,
+    statements:
+      after.requestsSinceBoot.sqlStatements - before.requestsSinceBoot.sqlStatements,
+    callbacks: observation.callbacks,
+  }
+  assert.deepEqual(observation, {
+    tables: [{ name: 'alpha' }, { name: 'beta' }],
+    ledger: 1_003,
+    callbacks: 0,
+  })
+  // only the three executable ids need primary-key probes in each writer.
+  // the 585 comment-only anchors and unmatched historical rows add no reads;
+  // every file still re-reads under its exclusive transaction.
+  // a statement list sent through execMany costs the same rows and statements
+  // as the same list sent one call at a time. the seed lands like a restore,
+  // so the ledger table arrives with no transaction journal or schema
+  // snapshot; the migration's first write to it records both here.
+  // the shared read preflight inspects six schema rows in one statement and
+  // session before the two migration writers. its overhead writes no rows.
+  assert.deepEqual(cost, {
+    rowsRead: 321,
+    rowsWritten: 44,
+    sessions: 3,
+    readSessions: 1,
+    statements: 70,
+    callbacks: 0,
+  })
+  const currentBefore = await fetch(`${base}/status/${namespace}`).then((r) => r.json())
+  const checks = await Promise.all(
+    Array.from({ length: 33 }, () => fetch(`${base}/current-check/${namespace}`))
+  )
+  for (const response of checks)
+    assert.equal(response.status, 200, await response.clone().text())
+  const currentAfter = await fetch(`${base}/status/${namespace}`).then((r) => r.json())
+  // every check opens one reader and no writer; caught-up checks write nothing.
+  assert.equal(
+    currentAfter.requestsSinceBoot.applicationSqlSessions -
+      currentBefore.requestsSinceBoot.applicationSqlSessions,
+    33
+  )
+  assert.equal(
+    currentAfter.requestsSinceBoot.applicationSqlReadSessions -
+      currentBefore.requestsSinceBoot.applicationSqlReadSessions,
+    33
+  )
+  assert.equal(
+    currentAfter.sqlBillingSinceBoot.rowsWritten -
+      currentBefore.sqlBillingSinceBoot.rowsWritten,
+    0
+  )
+  // raw application sql on a namespace nobody migrated converges the schema
+  // before the statement runs, so the tables it asks for already exist
+  const firstTouch = await fetch(
+    `${base}/first-touch/proj-untouched-${crypto.randomUUID()}`
+  )
+  assert.equal(firstTouch.status, 200, await firstTouch.clone().text())
+  assert.deepEqual(await firstTouch.json(), [{ name: 'alpha' }, { name: 'beta' }])
+  const proofResponse = await fetch(
+    `${base}/backup-proof/proj-backup-${crypto.randomUUID()}`,
+    { method: 'POST' }
+  )
+  assert.equal(proofResponse.status, 200, await proofResponse.clone().text())
+  const proof = await proofResponse.json()
+  assert.deepEqual(proof.copied, [{ rows: 8192, bytes: 32 * 1024 * 1024 }])
+  assert.deepEqual(proof.triggers, [])
+  assert.deepEqual(proof.dropped, [])
+  assert.deepEqual(proof.beforeMarker, proof.afterMarker)
+  assert.equal(proof.before.windowRows, proof.after.windowRows)
+  assert.equal(proof.importBefore.windowRows, proof.importAfter.windowRows)
+  assert.equal(proof.importAfter.tripped, false)
+  assert.match(proof.trippedApplicationWrite, /write budget/i)
+  assert.deepEqual(proof.imported, [{ rows: 2049 }])
+  assert.ok(proof.copyMs < 5000, `32 MiB copy took ${proof.copyMs}ms`)
+  console.log(
+    JSON.stringify({
+      event: 'backup_snapshot_copy',
+      bytes: proof.copied[0].bytes,
+      copyMs: proof.copyMs,
+      windowRowsBefore: proof.before.windowRows,
+      windowRowsAfter: proof.after.windowRows,
+      markerBefore: proof.beforeMarker,
+      markerAfter: proof.afterMarker,
+    })
+  )
+} finally {
+  server.kill()
+  await server.exited
+  rmSync(fixture, { recursive: true, force: true })
+}

@@ -1,0 +1,380 @@
+# Testing
+
+This is an honest assessment of what is tested, how, and what is not. The short
+version: the single query pull and push engine is genuinely
+differential-tested against the TypeScript reference and
+randomized-model-verified. Its deterministic seeded oracle covers named
+already-transformed ZQL ASTs, membership, multi-table writes, and in-place
+permission-transform replacement, with a live cross-check against stock
+zero-cache. The Cloudflare host has a real
+workerd fault, soak, and qualification matrix; and the jepsen-style ambitions
+were scoped down to what this system honestly needs: a composed fault nemesis
+with arm/fire/heal receipts, an engine and host mutation matrix that proves each
+included lane can go red, and the pinned Elle checker running on a real recorded
+workload history instead of a full Jepsen rig.
+
+## The three test tiers
+
+Testing is layered. Each tier exercises a different boundary.
+
+1. **Rust cargo suites** (`crates/sync-core/tests/`) test the engine as pure
+   logic against an in-memory rusqlite host.
+2. **sync-cf-host workerd lanes** (`packages/lime-sync-cf-host/`) test the compiled
+   WASM engine inside a real local Durable Object.
+3. **The harness** (`harness/`) runs full end-to-end conformance and
+   qualification against multiple sync targets, including a differential against
+   real zero-cache.
+
+## Cargo suites
+
+Every cargo suite drives the engine through a synchronous in-memory rusqlite host
+defined in `crates/sync-core/tests/common/mod.rs`. rusqlite is a dev-dependency
+only, so it never ships. There are over 120 test functions across the suite;
+three are `#[ignore]` measurements. Run them with `cargo test --workspace`
+(requires `bun` on PATH, because the differential lane shells out to the
+TypeScript reference).
+
+The suites that matter most:
+
+- **`differential.rs`** is the one true cross-implementation lane. A seeded
+  PRNG generates an operation trace (put, del, reject, upstream SQL, pull,
+  invalidate), and both the Rust engine and the executor-backed TypeScript host
+  (`harness/src/executor-host.ts`, via `crates/sync-core/ts-oracle/run-oracle.ts`)
+  execute the same trace. The base lane applies each side's patches to its own
+  simulated client store and compares store convergence after every pull,
+  because membership-driven query pulls and the reference change log can encode
+  the same result with different patch bytes. The query lane compares normalized
+  patches directly. Cookies and `unchanged` remain exact in both lanes. It runs
+  8 seeds of 200 steps each.
+- **`reference_delta.rs`** runs the reference core's delta cases through
+  `handle_query_pull`: cookie validation, push validation, snapshot and
+  unchanged and 409,
+  cursor diffs including float fidelity and primary-key changes, app-error
+  last-mutation-id semantics, replay idempotency, retention floor, epoch
+  invalidation, and membership-driven row changes.
+- **`query_model.rs`** is a randomized convergence model over 24 seeds. It
+  interleaves data changes with desired-query changes, applies every membership
+  patch to a simulated client store, and checks after each step that the store
+  equals the union of the group's live query results. Its oracle is internal,
+  so this is a property test, not a second implementation.
+- **`upstream.rs`** and **`paged_snapshot.rs`** cover the ingest apply path:
+  ordered changes, watermark idempotency, full-image updates and deletes,
+  out-of-order rejection, schema drift, legacy metadata migration, staged
+  snapshot generations, durable resume cursors, catch-up overlap, atomic
+  cutover, and epoch invalidation of pre-cutover clients.
+- **`upstream_corpus.rs`** is 7 behavioral CDC contracts adapted from Turso's
+  pinned CDC integration suite and Electric's transaction-fragmentation suite.
+  Because Orez captures changes with database-scoped triggers rather than a
+  connection-scoped CDC pragma, they assert the equivalent durable effects: a
+  failed upstream transaction rolls back rows, change log, and cursor together; a
+  successful batch commits them together; a no-op commit and a rolled-back write
+  emit no CDC and leave the connection usable; trigger CDC never captures its own
+  metadata writes and is visible across independent connections; schema drift
+  rolls back with an idempotent legacy-metadata upgrade; and a large transaction
+  converges without loss or duplication.
+- **The query suites** (`query_ast.rs`, `query_chat_shapes.rs`,
+  `query_chat_permissions.rs`, `query_membership.rs`, `query_related.rs`,
+  `query_pull.rs`, `query_narrowing.rs`, `query_windowed_corpus.rs`,
+  and `query_model.rs`) cover AST validation and SQL
+  compilation, Chat's real query shapes, Chat permission transforms with
+  explicit deny cases, per-group membership refcounts, related and windowed
+  subqueries, and the wire-level query pull path.
+- **`schema_hardening.rs`** is a security regression suite for DDL and trigger
+  injection, proving hostile table and column names cannot inject.
+
+## sync-native cargo tests
+
+The native host has its own cargo coverage, separate from the sync-core engine
+suites. `crates/sync-native/tests/library_api.rs` drives the real axum router
+through `tower`'s `oneshot`: health, a fresh query pull, push-then-pull,
+app-error last-mutation-id semantics, per-namespace isolation, and the
+server-owned admin-transaction protocol on `/admin/sql` end to end. That protocol
+is worker-owned: the namespace thread runs the actual `BEGIN`/`COMMIT`/`ROLLBACK`
+and flips its scheduler state only after that SQL succeeds, so the integration
+tests assert commit and rollback both excluding concurrent pull/push, wrong-id
+and duplicate-begin conflicts, malformed begin/end and transaction-control-in-a-
+query rejection (including comment-hidden control SQL), and a lost admin client
+reclaimed by the transaction lease. The router tests also prove that default
+hosts mint distinct 256-bit admin
+tokens, missing or incorrect credentials cannot execute admin SQL, every
+browser-origin admin request is denied, unknown browser origins cannot sync,
+and the exact allowed origin completes both preflight and pull with restricted
+CORS headers. The same router suite covers application-owned push settlement:
+exact acknowledgement validation, admin gating, cross-client diff and snapshot
+convergence, effects-before-LMID watermark order, and idempotent
+`alreadyProcessed` recovery without a duplicate LMID row.
+`crates/sync-native/src/namespace.rs` adds
+worker-level unit tests for the same scheduler where the lease and connection are
+directly controllable: a failed begin or failed commit that recovers instead of
+wedging, lease reclaim of a lost client, disconnect mid-step, and a plain-job
+flood that cannot starve the lease. `crates/sync-native/src/seed.rs` keeps its
+inline golden-seed test. The running binary's behavior over a real socket
+(graceful shutdown, the wake WebSocket under load) is still exercised only by the
+`rust-local` harness lanes.
+
+## sync-cf-host workerd lanes
+
+These run the compiled WASM engine inside a local Durable Object via
+`wrangler dev --local`. None of them need real Cloudflare. `bun run test` runs
+the whole sequence; the lanes:
+
+- **`config.test.mjs`** and **`write-safeguards.test.mjs`** are pure unit tests
+  (no workerd). They cover config validation (the mutators-versus-mutateUrl
+  invariants, upstream and retry bounds) and the circuit-breaker math (rolling
+  trip, exponential backoff, recovery, persisted cooldown, billable-cursor
+  accounting).
+- **`platform-test.mjs`** is the M0 platform contract: async transactions across
+  `await`, application errors and JS exceptions and Rust panics each rolling back
+  every effect and last-mutation-id, full value round-trip including large exact
+  decimals and float fidelity, and idle-teardown eviction.
+- **`integration-test.mjs`** is the production integration suite (50-plus
+  assertions): fresh query pull, named-query resolution and member
+  filtering, client-authored raw AST rejected, writer enable and disable, fault
+  injection at five boundary points, deferred effects running only after commit,
+  and wake WebSocket delivery.
+- **`ingest-test.mjs`** covers upstream ingest end to end: keyset-paged
+  retention-gap recovery, staged generation resume, adaptive page limits, the
+  billable-versus-logical write budget, delegated push with injected transient
+  failures and a bounded retry cap, and the runaway lane where a feed whose
+  cursor stalls trips the breaker to a 429
+  `ingestCursorStalled` and then recovers through the admin route.
+- **`restart-test.mjs`** verifies that desired-query state and persistent
+  namespace controls survive a real workerd restart.
+
+## The harness
+
+`harness/` runs the same test scripts against several `SyncTarget`s: real
+zero-cache with embedded Postgres (`stock-zero`), the TypeScript core
+(`orez-local`, `orez-cf`), and the Rust engine as native binary (`rust-local`)
+and WASM DO (`rust-cf`). Every lane writes through sync and to the upstream
+store, requires convergence, and compares against a fresh oracle read.
+
+**Conformance lanes** are the CI acceptance gate: `smoke.ts`,
+`multi-project-mount.ts`, `shapes.ts` (a 22-query cross-implementation
+differential), `sweep.ts` (seeded randomized differential), `propagation.ts`
+(wake latency), `queries.ts`, `query-diff.ts` (query membership differential
+against stock zero-cache), `permissions.ts`, and `storm.ts` (100 clients).
+
+**Qualification lanes** are the M6 matrix, dispatched by
+`harness/src/m6-runner.ts` as a native suite and a CF suite: protocol fuzz
+(10,000 seeded malformed cases, every one must return 4xx), eviction, retention
+reconnect, query tab churn, clock skew (plus or minus 24 hours), storage faults,
+backup and restore, and for the CF suite also WASM memory soak, push memory
+soak, and a rollback drill. The 2026-07-10 re-qualification recorded native 7 of
+7 and CF 9 of 9.
+
+**The portable upstream corpus** (`harness/src/upstream-corpus.ts`) replays the
+same behavioral scenarios across four hosts (the TypeScript oracle, stock
+zero-cache, native Rust `sync-native`, and the Rust CF Durable Object), comparing
+public observations (query results and durable rows) rather than any
+implementation's private CVR/CDC representation. **The generated state machine**
+(`harness/src/state-machine.ts`) is an Electric-style lifecycle model for the
+Rust hosts: a deterministic seeded trace mixes writes, desired-query changes,
+retention pruning, lost responses, and server and client restarts, and every
+operation compares live client views to an authoritative SQL oracle; a failure
+emits the seed, the full trace, and a delta-debugged (shrunk) reproducer under
+`harness/regressions/`. Its `--nemesis` mode composes a second fault axis on
+top: one-shot engine faults armed at named push/pull boundaries, a client
+transport pause held open across an engine-fault arm and a server restart (two
+fault classes active at once), and a full-prune-plus-restart step that proves
+the durable watermark keeps the served cookie monotonic over the same SQLite
+file. The transport pause also fires an engine fault **through** itself: while
+the primary client's pulls are gated, a non-writing observer client (whose pull
+is not gated) deterministically fires an armed `pull_after_commit` fault, so the
+two fault classes overlap in effect, not just in schedule. Every scheduled fault
+carries receipts — arm, then fired or a documented cancellation; pauses also
+record fire, heal, and the overlapping fault — and a generated schedule whose
+faults never fire, whose pause never fires or heals, or whose pause never
+overlaps a fired engine fault, fails as invalid instead of passing vacuously
+(replays and shrink candidates are judged on execution alone). See
+`docs/sync/nemesis-red-proof.md` for the red proofs.
+
+Before an explicit pruning pull, an armed pull error or quota must have a
+confirmed firing receipt and the affected client must complete a later successful
+pull. This also checks recovery when every query has been undesired. CI replays
+`harness/regressions/pull-fault-prune-recovery.json` alongside the generated seed;
+the explicit pull, retention floor, and view-oracle checks remain required.
+
+The same replay closes its first client while startup is still pending. Zero
+1.9.0 can create its active-client BroadcastChannel after that client's abort
+signal has fired, leaving the process alive after cleanup. Both the root and
+harness installs apply `patches/@rocicorp%2Fzero@1.9.0.patch`, which checks that
+signal before allocating the channel or client lock. The replay must exit before
+CI can start the generated schedule.
+
+**The engine and host mutation matrix** (`harness/mutants/`, runner
+`harness/scripts/mutation-matrix.ts`, results `docs/sync/mutation-matrix.md`)
+keeps twelve known bugs as compile-checked patches: nine in the Rust engine and
+three in the TypeScript Durable Object host. It records which compatible lane
+catches each patch and verifies the verdict against the lane's actual failure
+output. The host corpus covers a backup scan that bypasses its read session, a
+writer admitted while readers are active, and a commit that drops its pending
+changes instead of publishing them. Every mutant is caught by at least one
+suite. A new lane earns its place by going red on at least one mutant.
+
+**PR-gate budget** (audited 2026-07-16, run 29560870553): total wall clock is
+about ten minutes and the reliability lanes are not the bottleneck. The
+critical path is the root `test` job (about 6 minutes of vitest) and
+`native-integration`; the harness job finishes in under a minute and the
+`rust-local` job runs every consistency lane, Elle, query-diff, and the composed
+nemesis at 24 steps in about 2.5 minutes, all in parallel. Before demoting
+any reliability lane to nightly, check this balance again; the cheaper lever
+has been tooling installs shared across jobs, not lanes.
+
+CI runs these as release-blocking jobs. The `rust-local-faults` job runs the
+pinned corpus ledger, the portable corpus across the TypeScript oracle, stock
+zero-cache, and native Rust, rust-local transaction and storage faults, and the
+state machine against `rust-local`. The `sync-cf-host` job's `rust-cf continuous
+fault and lifecycle gates` step runs the portable corpus against `rust-cf` plus
+protocol fuzz, reconnect, eviction, storage faults, backup/restore, and the state
+machine against `rust-cf`; both jobs upload their seeds and minimized traces as
+artifacts. The heavier `harness/scripts/nightly.sh` cron lane widens the grid:
+the full four-host corpus, the M6 qualification matrix, and the state machine at
+80 steps across several seeds against both `rust-local` and `rust-cf`. Every
+lane above runs `rust-cf` against a local `wrangler dev` worker, never a real
+deployment. The separate `.github/workflows/deployed-qualification.yml`
+(weekly + `workflow_dispatch`, never on pull requests) is the credentialed
+counterpart: it deploys `packages/lime-sync-cf-host` to the account holding
+`CLOUDFLARE_API_TOKEN` and runs the bounded m6 CF fault suite (reconnect,
+eviction, storage-faults, backup-restore, state-machine 24 steps) against that
+live origin, then deletes the worker. Because it needs external credentials it
+is kept off the PR path (see "What is not covered" item 7).
+
+`harness/src/soot-deployed-conformance.ts` is a faithful port of Contrast's own
+integration test, run against the deployed worker in Contrast's dialect. It exists
+because the generic fixture lanes cannot target Contrast's exact composition.
+
+## Data-worker CDC and Chat compatibility
+
+The root TypeScript suite covers the Postgres-to-DO-SQLite path separately from
+the Rust engine. Run it from the repository root with `bun run test`. The most
+relevant files are:
+
+- `packages/lime-sync/src/cf-do/cdc.test.ts`: real-SQLite logical CDC, including full row images,
+  failed multi-row statements, SQLite transaction rollback, primary-key
+  changes, schema changes, and indirect writes from business triggers. The
+  failed-statement, rollback, and primary-key cases are adapted from Turso's CDC
+  integration suite.
+- `packages/lime-sync/src/cf-do/worker-cdc.test.ts`: staging, transaction grouping, publish versus
+  rollback-only capture, and DDL integration at the `ZeroDO` boundary.
+- `packages/lime-sync/src/cf-do/worker-transaction.test.ts`: application-SQL transaction commit
+  and rollback behavior at the `ZeroDO` boundary.
+
+## What is not covered
+
+State this plainly rather than implying blanket coverage.
+
+1. **The query-definition computation has no oracle differential.** The
+   `differential.rs` oracle now generates a query axis — named
+   already-transformed ZQL ASTs, query registration/removal, membership
+   changes, and multi-table writes, including replacing a query's permission
+   transform in place — alongside the base put/del/reject/upstream/pull/
+   invalidate ops, and shrinks failures to minimal traces. What it feeds the
+   engine are _already-transformed_ ASTs: the computation of a transform from a
+   query definition and authenticated claims is exercised by the host
+   integration and permission suites, plus the live `query-diff.ts` comparison,
+   not by the deterministic oracle.
+2. **`sync-wasm` is covered at its boundary, not exhaustively.** Three Node
+   wasm tests drive a real SQLite adapter through the exported push, pull,
+   error, preflight, and finalize boundary, and a native race drives 256 engine
+   writes from eight OS threads through one namespace to prove the
+   single-writer invariant (gap-free LMIDs, effect-before-ack, one executing
+   worker). Both have recorded red mutations
+   (`docs/sync/sync-wasm-red-proof.md`). Everything else in the WASM path is
+   still exercised indirectly through the workerd lanes and `rust-cf`.
+3. **`sync-native`'s real-socket behavior is harness-only.** The crate now has
+   cargo coverage (see "sync-native cargo tests"): a library-API integration
+   suite over the axum router and worker-level unit tests for the
+   admin-transaction scheduler. What those do not cover is the running binary
+   over a real TCP socket, graceful shutdown, and the wake WebSocket under load;
+   that behavior is exercised only by the `rust-local` harness lanes.
+4. **Elle now runs the pinned checker on a real recorded workload.** The
+   `rust-local` CI job records the atomic-visibility lane's history, then
+   `scripts/elle/check-history.sh` projects it and runs the pinned elle-cli
+   0.1.9 standalone jar (verified by SHA-256, Java 21) with `--model
+list-append --consistency-models serializable`, failing the job on `false`,
+   `unknown`, or malformed output. `projectElleListAppend`
+   (`src/consistency/history.ts`) projects every event carrying list-append
+   micro-ops (the atomic-visibility lane's `read` and `mutation` kinds, not just
+   the dedicated `transaction` kind), and `src/consistency/elle-project.ts`
+   restricts each observed list to the values appended within the history so the
+   tracked list-append sub-history embedded in a seeded store is what elle
+   analyzes. `serializable` is the honest model here: the workload's none-or-all
+   visibility means an empty read orders before the append and a full read after
+   it, so a serial order exists; a torn read surfaces as a G-single anomaly (red
+   proof in `docs/sync/lane-red-proof.md`). Realtime/strict variants are not
+   claimed for asynchronous cache reads. Bounds worth stating: elle checks only
+   the atomic-visibility workload (one authoritative multi-key append plus
+   non-writing complete-list reads), and because it drops values outside the
+   append universe it does not detect a read of a value no transaction appended.
+   `scripts/elle/self-test.sh` remains a separate checker-boundary self-test
+   over toy fixtures. Still missing: there is no network fault injection (no
+   partition, latency, or packet-drop lanes). Faults in the real harness are
+   process-kill, injected DO storage faults (`storage-faults.ts`), eviction
+   (`eviction.ts`), and the admin-transaction lease and rollback paths only.
+5. **The upstream IVM fuzzer was not ported.** `protocol-fuzz.ts` fuzzes
+   malformed input structurally (every case must 4xx); it does not fuzz
+   semantically valid query shapes for correctness. The real IVM fuzzer still
+   lives in Rocicorp's `mono` repo and is run out of band.
+6. **`soot-deployed-conformance.ts` and `query-security.ts` are manual lanes.**
+   They are not in CI, `m6-runner`, or the nightly script. Their green results
+   are recorded point-in-time results, not continuously enforced gates.
+7. **The `rust-cf` query-diff stall is fixed; the deployed CF lane's first
+   credentialed run is still pending.** The intermittent `allProjects`
+   completion stall was the harness's vendored `httpPullTransport.ts` lagging
+   canonical fix `1efd3e5`: a got-query ack rode an early poke, a following
+   snapshot-reset pull (leading `rowsPatch` `clear`) wiped the stock client's
+   got-query marks, and the transport never re-asserted an ack it believed
+   delivered, so the view never reached `complete` (load-dependent). The got-set
+   re-assertion + dedupe is ported into the vendored transport and pinned by
+   `harness/src/vendor/httpPullTransport.stall.test.ts` (red before the port,
+   green after); repeated `query-diff --against rust-cf` runs against local
+   workerd pass. What is still uncovered: the credentialed deployed Cloudflare
+   qualification (`.github/workflows/deployed-qualification.yml`, weekly +
+   dispatch, never on PRs — it deploys the rust-cf WASM host and runs the
+   bounded m6 CF fault suite against a live origin) has been validated only
+   against a local workerd stand-in; its first real credentialed run has not
+   happened yet, so the deployed-origin results are not enforced evidence until
+   that schedule fires.
+8. **A bounded longevity soak is now a gated nightly lane; hours-long
+   longevity and larger load grids are not.** `harness/src/longevity.ts` seeds a
+   fixed 1000-row pool and runs ~25 minutes of sustained `rust-local` update load
+   (six clients, three writers issuing `setRank` updates) with hard pass/fail
+   invariants enforced at every 60-second checkpoint — every client's `(id, rank)`
+   view equals the SQL oracle (a lost or stale update is caught, not just a lost
+   row), the native process RSS stays under a fixed ceiling with large headroom
+   (the bounded working set keeps it flat, so a climb is a real leak), and the
+   server-confirmed watermark never decreases — plus a final convergence barrier
+   (unique sentinel update, every client and a fresh late client equal the
+   authority) that proves zero lost writes. It is wired into
+   `.github/workflows/nightly.yml` as its own `longevity-soak` job, uploads its
+   samples, and is proved able to fail: engine mutant M1's skipped LMID strands
+   the checkpoint drain, and the RSS ceiling goes red mid-soak under a lowered
+   bound (see `docs/sync/nemesis-red-proof.md`). PR CI is untouched. Still
+   historical single runs, not gated: multi-hour longevity, the larger bench/load
+   grids in `harness/scripts/nightly.sh`, and the CF-side memory soaks.
+
+9. **The R2 namespace backup has in-process host coverage, and had no concurrency
+   coverage at all until 2026-08-18.** `harness/src/backup-restore.ts` covers
+   the sync host's own backup and stops the writer first
+   (`/admin/writer`, `backup-restore.ts:52`), so it structurally cannot observe
+   a write racing an export. The separate `lime-sync` namespace backup, which
+   dumps a whole namespace to R2 for disaster recovery
+   (`packages/lime-sync/src/cf-do/namespace-backup.ts`), is covered by
+   `namespace-backup.test.ts` plus the production wiring test in
+   `lite-data-worker.test.ts`. The suite tests paging, ordering, restore, and an
+   invariant-preserving commit racing the scan. The race was added after a real
+   defect: the export read one page per application-SQL session, and because the
+   durable object admits a write session the moment the reader set drains
+   (`worker.ts` `canAdmitApplicationSqlSession`), a commit landed between two
+   pages and the dump held a state no transaction produced. The scan now reads
+   physical snapshots. The pre-write/next-export regression pins both sides of
+   a mid-scan commit; continuous commits cannot force a restart. The real worker
+   test proves writer admission, and the migration workerd script measures a
+   32 MiB copy, unchanged marker and budget, trigger-free tables, and cleanup.
+   Background chunk preemption remains bounded and R2 stays outside the read
+   session. The remaining
+   gap is that the durable object's own maintenance writes (transaction
+   rollback, recovery) run outside the admission queue, so a read session is
+   writer exclusion and not snapshot isolation (`application-sql.ts`,
+   `readTransaction`).

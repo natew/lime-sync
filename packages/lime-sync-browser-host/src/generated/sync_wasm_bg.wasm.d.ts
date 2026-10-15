@@ -1,0 +1,35 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const engine_apply_snapshot_changes: (a: any, b: any, c: number, d: number, e: any) => [number, number, number];
+export const engine_apply_snapshot_page: (a: any, b: any, c: number, d: number, e: number, f: number, g: any, h: number, i: number) => [number, number, number];
+export const engine_apply_upstream: (a: any, b: any, c: any) => [number, number, number];
+export const engine_apply_upstream_snapshot: (a: any, b: any, c: any) => [number, number, number];
+export const engine_assemble_push_response: (a: any) => [number, number, number];
+export const engine_authorize_realtime_subscription: (a: any, b: any, c: number, d: number, e: number, f: number, g: number, h: number, i: any) => [number, number, number];
+export const engine_begin_snapshot_generation: (a: any, b: any, c: number, d: number) => [number, number, number];
+export const engine_compile_query: (a: any, b: any, c: any) => [number, number, number];
+export const engine_finalize: (a: any, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+export const engine_finalize_snapshot_generation: (a: any, b: any, c: number, d: number, e: number, f: number) => [number, number, number];
+export const engine_handle_query_pull: (a: any, b: any, c: number, d: number, e: any, f: number, g: number) => [number, number, number];
+export const engine_init_query_schema: (a: any) => [number, number];
+export const engine_init_schema: (a: any, b: any) => [number, number];
+export const engine_invalidate: (a: any) => [number, number];
+export const engine_memory_bytes: () => [number, number, number];
+export const engine_preflight: (a: any, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
+export const engine_prune: (a: any, b: number, c: number) => [number, number];
+export const engine_push_validate: (a: any) => [number, number, number];
+export const engine_read_snapshot_progress: (a: any) => [number, number, number];
+export const engine_record_app_error: (a: any, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
+export const engine_schema_revision: () => [number, number];
+export const engine_state: (a: any) => [number, number, number];
+export const engine_version: () => [number, number];
+export const engine_wake_targets: (a: any, b: any, c: number, d: number) => [number, number, number];
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_start: () => void;

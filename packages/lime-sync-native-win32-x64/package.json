@@ -1,0 +1,23 @@
+{
+  "name": "lime-sync-native-win32-x64",
+  "version": "0.1.6",
+  "description": "Prebuilt Orez sync-native host for Windows x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natew/lime-sync.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin",
+    "LICENSES.txt"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

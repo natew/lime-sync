@@ -1,0 +1,16 @@
+{
+  "name": "sync-wasm",
+  "type": "module",
+  "version": "0.1.6",
+  "license": "MIT",
+  "files": [
+    "sync_wasm_bg.wasm",
+    "sync_wasm.js",
+    "sync_wasm.d.ts"
+  ],
+  "main": "sync_wasm.js",
+  "types": "sync_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

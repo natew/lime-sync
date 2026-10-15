@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["import"],
+  "rules": {
+    "import/no-cycle": "error",
+    "no-unused-vars": "off",
+    "no-empty-file": "off",
+    "no-console": "off",
+    "no-async-promise-executor": "off",
+    "no-unused-expressions": "off",
+    "no-constant-binary-expression": "off",
+    "no-control-regex": "off"
+  },
+  "ignorePatterns": ["**/dist/**", "**/*.d.ts", "**/node_modules/**"]
+}

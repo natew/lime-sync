@@ -1,0 +1,260 @@
+import { describe, expect, test } from 'bun:test'
+
+import numberStorageValues from '../../harness/fixtures/zero-number-storage-values.json'
+import {
+  executeTransactionQueryPlan,
+  executeTransactionQueryPlanAsync,
+  TransactionQueryBudgetError,
+} from './src/transaction-query.ts'
+
+const text = (value) => ({ kind: 'literal', value: { kind: 'text', value } })
+const parent = (field) => ({ kind: 'parent_field', field })
+
+function plan({ rootSingular = false, childSingular = false } = {}) {
+  return {
+    rootTable: 'user',
+    planHash: '0123456789abcdef',
+    root: {
+      table: 'user',
+      singular: rootSingular,
+      sql: 'root',
+      bindings: [text('enabled')],
+      columns: [
+        { name: 'id', columnType: 'string' },
+        { name: 'active', columnType: 'boolean' },
+        { name: 'profile', columnType: 'json' },
+      ],
+      relationships: [
+        {
+          name: 'posts',
+          node: {
+            table: 'post',
+            singular: childSingular,
+            sql: 'child',
+            bindings: [parent('id')],
+            columns: [
+              { name: 'id', columnType: 'string' },
+              { name: 'authorId', columnType: 'string' },
+              { name: 'rank', columnType: 'number' },
+            ],
+            relationships: [],
+          },
+        },
+      ],
+    },
+  }
+}
+
+function numberPlan() {
+  return {
+    rootTable: 'sample',
+    planHash: 'fedcba9876543210',
+    root: {
+      table: 'sample',
+      singular: false,
+      sql: 'numbers',
+      bindings: [],
+      columns: [{ name: 'value', columnType: 'number' }],
+      relationships: [],
+    },
+  }
+}
+
+describe('transaction query materializer', () => {
+  test('hydrates related rows and decodes logical column types', () => {
+    const calls = []
+    const result = executeTransactionQueryPlan(plan(), (sql, params) => {
+      calls.push([sql, params])
+      if (sql === 'root') {
+        return [
+          { id: 'u1', active: 1, profile: '{"theme":"dark"}' },
+          { id: 'u2', active: 0, profile: null },
+        ]
+      }
+      return params[0] === 'u1' ? [{ id: 'p1', authorId: 'u1', rank: 3 }] : []
+    })
+
+    expect(result).toEqual([
+      {
+        id: 'u1',
+        active: true,
+        profile: { theme: 'dark' },
+        posts: [{ id: 'p1', authorId: 'u1', rank: 3 }],
+      },
+      { id: 'u2', active: false, profile: null, posts: [] },
+    ])
+    expect(calls).toEqual([
+      ['root', ['enabled']],
+      ['child', ['u1']],
+      ['child', ['u2']],
+    ])
+  })
+
+  test('hydrates recursively nested relationships', () => {
+    const nested = plan()
+    nested.root.relationships[0].node.relationships = [
+      {
+        name: 'comments',
+        node: {
+          table: 'comment',
+          singular: false,
+          sql: 'grandchild',
+          bindings: [parent('id')],
+          columns: [
+            { name: 'id', columnType: 'string' },
+            { name: 'postId', columnType: 'string' },
+          ],
+          relationships: [],
+        },
+      },
+    ]
+    const result = executeTransactionQueryPlan(nested, (sql, params) => {
+      if (sql === 'root') return [{ id: 'u1', active: 1, profile: null }]
+      if (sql === 'child') return [{ id: 'p1', authorId: params[0], rank: 3 }]
+      return [{ id: 'c1', postId: params[0] }]
+    })
+
+    expect(result).toEqual([
+      {
+        id: 'u1',
+        active: true,
+        profile: null,
+        posts: [
+          {
+            id: 'p1',
+            authorId: 'u1',
+            rank: 3,
+            comments: [{ id: 'c1', postId: 'p1' }],
+          },
+        ],
+      },
+    ])
+  })
+
+  test('matches the sync driver through ordered HTTP selects', async () => {
+    const rowsFor = (sql, params) => {
+      if (sql === 'root') {
+        return [
+          { id: 'u1', active: 1, profile: '{"theme":"dark"}' },
+          { id: 'u2', active: 0, profile: null },
+        ]
+      }
+      return params[0] === 'u1' ? [{ id: 'p1', authorId: 'u1', rank: 3 }] : []
+    }
+    const sync = executeTransactionQueryPlan(plan(), rowsFor)
+    const calls = []
+    const asyncResult = await executeTransactionQueryPlanAsync(
+      plan(),
+      async (sql, params) => {
+        calls.push([sql, params])
+        const response = Response.json({ rows: rowsFor(sql, params) })
+        return (await response.json()).rows
+      }
+    )
+
+    expect(asyncResult).toEqual(sync)
+    expect(calls).toEqual([
+      ['root', ['enabled']],
+      ['child', ['u1']],
+      ['child', ['u2']],
+    ])
+  })
+
+  test('matches Rust number storage decoding in both execution drivers', async () => {
+    const storageRows = numberStorageValues.accepted.map(({ input }) => ({
+      value: input,
+    }))
+    const expected = numberStorageValues.accepted.map(({ expected }) => ({
+      value: expected,
+    }))
+
+    const sync = executeTransactionQueryPlan(numberPlan(), () => storageRows)
+    const asyncResult = await executeTransactionQueryPlanAsync(
+      numberPlan(),
+      async () => (await Response.json({ rows: storageRows }).json()).rows
+    )
+
+    expect(sync).toEqual(expected)
+    expect(asyncResult).toEqual(sync)
+    for (const value of numberStorageValues.rejected) {
+      expect(() => executeTransactionQueryPlan(numberPlan(), () => [{ value }])).toThrow(
+        'does not match schema type number'
+      )
+      await expect(
+        executeTransactionQueryPlanAsync(numberPlan(), async () => [{ value }])
+      ).rejects.toThrow('does not match schema type number')
+    }
+  })
+
+  test('aborts an HTTP execution budget before the next parent select', async () => {
+    const calls = []
+    let caught
+    try {
+      await executeTransactionQueryPlanAsync(
+        plan(),
+        async (sql, params) => {
+          calls.push([sql, params])
+          const rows =
+            sql === 'root'
+              ? [
+                  { id: 'u1', active: 1, profile: null },
+                  { id: 'u2', active: 1, profile: null },
+                ]
+              : [{ id: 'p1', authorId: params[0], rank: 3 }]
+          return (await Response.json({ rows }).json()).rows
+        },
+        { queryName: 'asyncUsersWithPosts', budget: { maxSelects: 2 } }
+      )
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(TransactionQueryBudgetError)
+    expect(caught).toEqual(
+      expect.objectContaining({
+        code: 'transaction_query_budget_exceeded',
+        query: 'asyncUsersWithPosts',
+        rows: 3,
+        selects: 3,
+      })
+    )
+    expect(calls).toEqual([
+      ['root', ['enabled']],
+      ['child', ['u1']],
+    ])
+  })
+
+  test('uses undefined for an empty singular root and null for a singular child', () => {
+    expect(executeTransactionQueryPlan(plan({ rootSingular: true }), () => [])).toBe(
+      undefined
+    )
+
+    const result = executeTransactionQueryPlan(plan({ childSingular: true }), (sql) =>
+      sql === 'root' ? [{ id: 'u1', active: 1, profile: null }] : []
+    )
+    expect(result).toEqual([{ id: 'u1', active: true, profile: null, posts: null }])
+  })
+
+  test('rejects a malformed plan before executing SQL', () => {
+    let executed = false
+    expect(() =>
+      executeTransactionQueryPlan(
+        { ...plan(), root: { ...plan().root, relationships: [{ name: 'bad' }] } },
+        () => {
+          executed = true
+          return []
+        }
+      )
+    ).toThrow('compiled transaction query plan')
+    expect(executed).toBe(false)
+  })
+
+  test('rejects an integer result that cannot round-trip through a Zero number', () => {
+    const numeric = plan()
+    numeric.root.relationships = []
+    numeric.root.columns = [{ name: 'rank', columnType: 'number' }]
+    expect(() =>
+      executeTransactionQueryPlan(numeric, () => [{ rank: 9_007_199_254_740_992n }])
+    ).toThrow('does not match schema type number')
+  })
+})

@@ -1,0 +1,464 @@
+import type {
+  CompiledTransactionQueryPlan,
+  TransactionQueryBudget,
+} from 'lime-sync-cf-host/transaction-query'
+import type {
+  ExecResult,
+  SqlStatementMetadata,
+  TransactionQueryFormat,
+} from 'lime-sync-executor'
+
+export type ApplicationSqlQueryCompiler = (
+  ast: unknown,
+  format: TransactionQueryFormat
+) => CompiledTransactionQueryPlan | Promise<CompiledTransactionQueryPlan>
+
+export type ApplicationSqlTable = Pick<SqlStatementMetadata, 'table' | 'publicTable'> & {
+  /** capture rollback images without publishing this table to Zero clients */
+  publish?: boolean
+}
+
+export type ApplicationSqlExecResult = ExecResult
+
+export type ApplicationSqlStatement = {
+  sql: string
+  params?: readonly unknown[]
+  metadata?: SqlStatementMetadata
+}
+
+/**
+ * what the durable object answers for a statement list. a statement failure
+ * comes back as data rather than a thrown error because rpc keeps only an
+ * error's message, and the caller needs the position to name the statement.
+ */
+export type ApplicationSqlExecManyOutcome =
+  | { results: ApplicationSqlExecResult[] }
+  | { failedIndex: number; message: string }
+
+export class ApplicationSqlStatementError extends Error {
+  constructor(
+    readonly statementIndex: number,
+    message: string
+  ) {
+    super(message)
+    this.name = 'ApplicationSqlStatementError'
+  }
+}
+
+export type ApplicationSqlTransaction = {
+  exec(
+    sql: string,
+    params?: readonly unknown[],
+    metadata?: SqlStatementMetadata
+  ): Promise<ApplicationSqlExecResult>
+  /**
+   * every statement in one durable object call and one storage transaction.
+   * a write session holds the exclusive writer across each round trip, so a
+   * list of statements sent one at a time holds it for the whole exchange.
+   */
+  execMany(
+    statements: readonly ApplicationSqlStatement[]
+  ): Promise<ApplicationSqlExecResult[]>
+  query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: readonly unknown[]
+  ): Promise<Row[]>
+  queryAst<Result = unknown>(
+    ast: unknown,
+    format: TransactionQueryFormat,
+    queryName?: string
+  ): Promise<Result>
+  registerTables(tables: readonly ApplicationSqlTable[]): Promise<void>
+}
+
+export type ApplicationSqlTransactionWork<Value> = (
+  tx: ApplicationSqlTransaction
+) => Value | Promise<Value>
+
+/** the session methods a transaction executor is built over */
+export type ApplicationSqlSessionExecutor = Pick<
+  ApplicationSqlSessionRpc,
+  | 'exec'
+  | 'execMany'
+  | 'query'
+  | 'queryPreemptible'
+  | 'queryPlan'
+  | 'queryPlanPreemptible'
+  | 'registerTables'
+>
+
+/**
+ * the one transaction executor over an application SQL session, whether the
+ * session is reached over RPC from a worker or held directly inside the
+ * durable object. every method of ApplicationSqlTransaction is defined here,
+ * so a session-backed client cannot drift from the contract.
+ */
+export function applicationSqlSessionTransaction(
+  session: ApplicationSqlSessionExecutor,
+  background: boolean,
+  compileQuery: ApplicationSqlQueryCompiler,
+  queryBudget?: Partial<TransactionQueryBudget>
+): ApplicationSqlTransaction {
+  return {
+    exec: (sql, params = [], metadata) => session.exec(sql, params, metadata),
+    execMany: async (statements) => {
+      if (statements.length === 0) return []
+      const outcome = await session.execMany(statements)
+      if ('failedIndex' in outcome) {
+        throw new ApplicationSqlStatementError(outcome.failedIndex, outcome.message)
+      }
+      return outcome.results
+    },
+    query: async (sql, params = []) =>
+      background
+        ? applicationSqlPreemptibleValue(await session.queryPreemptible(sql, params))
+        : session.query(sql, params),
+    async queryAst(ast, format, queryName) {
+      const plan = await compileQuery(ast, format)
+      if (background) {
+        return applicationSqlPreemptibleValue(
+          await session.queryPlanPreemptible(plan, queryName, queryBudget)
+        )
+      }
+      return session.queryPlan(plan, queryName, queryBudget)
+    },
+    registerTables: (tables) => session.registerTables(tables),
+  }
+}
+
+/**
+ * admission lane for one application SQLite session.
+ *
+ * a read session shares the database with every other read session and refuses
+ * mutating SQL. a write session (the default) excludes every other session for
+ * its whole life, which is what the row-undo journal needs to be able to roll
+ * one transaction back without stepping on another's images.
+ */
+export type ApplicationSqlSessionPriority = 'background' | 'normal' | 'latency-sensitive'
+
+export type ApplicationSqlSessionOptions = {
+  readOnly?: boolean
+  /**
+   * latency-sensitive sessions enter ahead of queued normal work while keeping
+   * FIFO order within their own class. use only for short control transactions
+   * whose deadline protects correctness; active normal and latency-sensitive
+   * transactions are never preempted. callers must bound this traffic because
+   * sustained priority work can delay normal sessions.
+   *
+   * background is for consistent maintenance reads that may span network I/O.
+   * they enter behind request work and a writer preempts an active background
+   * reader, causing its next statement or commit to fail. the reader must treat
+   * that failure as an abandoned operation rather than publish partial output.
+   */
+  priority?: ApplicationSqlSessionPriority
+}
+
+export type ApplicationSqlPreemptibleResult<Value> =
+  | { outcome: 'completed'; value: Value }
+  | { outcome: 'preempted' }
+
+export class ApplicationSqlSessionPreemptedError extends Error {
+  constructor() {
+    super('background application SQLite session was preempted')
+    this.name = 'ApplicationSqlSessionPreemptedError'
+  }
+}
+
+export function applicationSqlPreemptibleValue<Value>(
+  result: ApplicationSqlPreemptibleResult<Value>
+): Value {
+  if (result.outcome === 'preempted') {
+    throw new ApplicationSqlSessionPreemptedError()
+  }
+  return result.value
+}
+
+/**
+ * private durable object RPC protocol. the session capability is returned
+ * before it asks for ownership, and `begin()` resolves when the durable object
+ * grants this session its turn in priority and arrival order. a cancellation
+ * signal closes a queued session or rolls back an active session before
+ * rejecting work.
+ */
+export type ApplicationSqlSessionRpc = Disposable & {
+  begin(): Promise<void>
+  query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: readonly unknown[]
+  ): Promise<Row[]>
+  queryPreemptible<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: readonly unknown[]
+  ): Promise<ApplicationSqlPreemptibleResult<Row[]>>
+  exec(
+    sql: string,
+    params?: readonly unknown[],
+    metadata?: SqlStatementMetadata
+  ): Promise<ApplicationSqlExecResult>
+  execMany(
+    statements: readonly ApplicationSqlStatement[]
+  ): Promise<ApplicationSqlExecManyOutcome>
+  queryPlan<Result = unknown>(
+    plan: CompiledTransactionQueryPlan,
+    queryName?: string,
+    queryBudget?: Partial<TransactionQueryBudget>
+  ): Promise<Result>
+  queryPlanPreemptible<Result = unknown>(
+    plan: CompiledTransactionQueryPlan,
+    queryName?: string,
+    queryBudget?: Partial<TransactionQueryBudget>
+  ): Promise<ApplicationSqlPreemptibleResult<Result>>
+  registerTables(tables: readonly ApplicationSqlTable[]): Promise<void>
+  commit(): Promise<void>
+  commitPreemptible(): Promise<ApplicationSqlPreemptibleResult<void>>
+  rollback(): Promise<void>
+}
+
+export type ApplicationSqlRpc = {
+  applicationSqlSession(
+    sessionID: string,
+    options?: ApplicationSqlSessionOptions
+  ): Promise<ApplicationSqlSessionRpc>
+  applicationSqlQuery<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: readonly unknown[],
+    options?: Pick<ApplicationSqlSessionOptions, 'priority'>
+  ): Promise<Row[]>
+}
+
+export type ApplicationSqlDurableObjectNamespace = {
+  idFromName(name: string): unknown
+  get(id: unknown): ApplicationSqlRpc
+}
+
+export type ApplicationSqlClient = {
+  readonly namespace: string
+  /**
+   * Read-only: runs on the shared read lane, so a mutating statement is
+   * rejected. A write (`INSERT ... RETURNING` included) belongs in exec() or
+   * transaction(), which take the write lane.
+   */
+  query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: readonly unknown[]
+  ): Promise<Row[]>
+  exec(
+    sql: string,
+    params?: readonly unknown[],
+    metadata?: SqlStatementMetadata
+  ): Promise<ApplicationSqlExecResult>
+  registerTables(tables: readonly ApplicationSqlTable[]): Promise<void>
+  transaction<Value>(
+    compileQuery: ApplicationSqlQueryCompiler,
+    work: ApplicationSqlTransactionWork<Value>,
+    queryBudget?: Partial<TransactionQueryBudget>
+  ): Promise<Value>
+  /**
+   * Same statements, read-only admission. Concurrent read transactions run
+   * together instead of queueing behind each other, and no application-SQL
+   * write session is admitted while any of them is open. The durable object's
+   * own maintenance writes (transaction rollback, recovery) run outside this
+   * queue, so that is admission-order fairness, not snapshot isolation.
+   * A mutating statement is rejected rather than escalated.
+   */
+  readTransaction<Value>(
+    compileQuery: ApplicationSqlQueryCompiler,
+    work: ApplicationSqlTransactionWork<Value>,
+    queryBudget?: Partial<TransactionQueryBudget>
+  ): Promise<Value>
+}
+
+export type ApplicationSqlClientOptions = {
+  signal?: AbortSignal
+  priority?: ApplicationSqlSessionPriority
+}
+
+function canceled(signal: AbortSignal): unknown {
+  return (
+    signal.reason ??
+    new DOMException('application SQLite request was canceled', 'AbortError')
+  )
+}
+
+async function raceAbort<Value>(
+  signal: AbortSignal | undefined,
+  pending: Promise<Value>
+): Promise<Value> {
+  if (!signal) return pending
+  // once the abort wins the race nothing observes `pending` again, and a
+  // canceled session's admission is rejected by the durable object on rollback.
+  void pending.catch(() => {})
+  signal.throwIfAborted()
+  let rejectAbort: (reason: unknown) => void = () => {}
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject
+  })
+  void aborted.catch(() => {})
+  const abort = () => rejectAbort(canceled(signal))
+  signal.addEventListener('abort', abort, { once: true })
+  try {
+    return await Promise.race([pending, aborted])
+  } finally {
+    signal.removeEventListener('abort', abort)
+  }
+}
+
+async function withApplicationSqlSession<Value>(
+  target: ApplicationSqlRpc,
+  namespace: string,
+  signal: AbortSignal | undefined,
+  sessionOptions: ApplicationSqlSessionOptions,
+  work: (session: ApplicationSqlSessionRpc) => Value | Promise<Value>
+): Promise<Value> {
+  const sessionID = crypto.randomUUID()
+  const caller = new Error()
+  const startedAt = performance.now()
+  let phaseStartedAt = startedAt
+  const phases: Record<
+    'open' | 'begin' | 'work' | 'commit' | 'rollback' | 'dispose',
+    number | null
+  > = {
+    open: null,
+    begin: null,
+    work: null,
+    commit: null,
+    rollback: null,
+    dispose: null,
+  }
+  let phase: keyof typeof phases = 'open'
+  let completed = false
+  try {
+    let value: Value
+    {
+      using session = await target.applicationSqlSession(sessionID, sessionOptions)
+      const openedAt = performance.now()
+      phases.open = openedAt - phaseStartedAt
+      phase = 'begin'
+      phaseStartedAt = openedAt
+      try {
+        // admission settles when the durable object grants this session its turn.
+        await raceAbort(signal, session.begin())
+        const admittedAt = performance.now()
+        phases.begin = admittedAt - phaseStartedAt
+        phase = 'work'
+        phaseStartedAt = admittedAt
+        value = await raceAbort(signal, Promise.resolve(work(session)))
+        signal?.throwIfAborted()
+        const workedAt = performance.now()
+        phases.work = workedAt - phaseStartedAt
+        phase = 'commit'
+        phaseStartedAt = workedAt
+        if (sessionOptions.priority === 'background') {
+          applicationSqlPreemptibleValue(await session.commitPreemptible())
+        } else {
+          await session.commit()
+        }
+        const committedAt = performance.now()
+        phases.commit = committedAt - phaseStartedAt
+        phase = 'dispose'
+        phaseStartedAt = committedAt
+        completed = true
+      } catch (error) {
+        const failedAt = performance.now()
+        phases[phase] = failedAt - phaseStartedAt
+        phase = 'rollback'
+        phaseStartedAt = failedAt
+        await session.rollback().catch(() => {})
+        const rolledBackAt = performance.now()
+        phases.rollback = rolledBackAt - phaseStartedAt
+        phase = 'dispose'
+        phaseStartedAt = rolledBackAt
+        throw error
+      }
+    }
+    return value
+  } finally {
+    const finishedAt = performance.now()
+    phases[phase] = finishedAt - phaseStartedAt
+    if (finishedAt - startedAt >= 500) {
+      // join client round trips with database queue and hold times by session id.
+      // logging must never replace the original result or error.
+      try {
+        console.info(
+          JSON.stringify({
+            event: 'orez_application_sql_session_slow',
+            sessionID,
+            namespace: namespace.slice(0, 200),
+            readOnly: sessionOptions.readOnly === true,
+            priority: sessionOptions.priority ?? 'normal',
+            outcome: completed ? 'completed' : 'failed',
+            durationMs: Math.round(finishedAt - startedAt),
+            phases: Object.fromEntries(
+              Object.entries(phases).map(([name, ms]) => [
+                name,
+                ms === null ? null : Math.round(ms),
+              ])
+            ),
+            caller: caller.stack?.split('\n').slice(1).join('\n').slice(0, 2048),
+          })
+        )
+      } catch {}
+    }
+  }
+}
+
+export function createApplicationSqlClient(
+  durableObjects: ApplicationSqlDurableObjectNamespace,
+  namespace: string,
+  options: ApplicationSqlClientOptions = {}
+): ApplicationSqlClient {
+  if (!namespace) throw new TypeError('application SQLite namespace is required')
+  const target = durableObjects.get(durableObjects.idFromName(namespace))
+  const session = <Value>(
+    sessionOptions: ApplicationSqlSessionOptions,
+    work: (session: ApplicationSqlSessionRpc) => Value | Promise<Value>
+  ) =>
+    withApplicationSqlSession(
+      target,
+      namespace,
+      options.signal,
+      options.priority
+        ? { ...sessionOptions, priority: options.priority }
+        : sessionOptions,
+      work
+    )
+  const transaction = <Value>(
+    sessionOptions: ApplicationSqlSessionOptions,
+    compileQuery: ApplicationSqlQueryCompiler,
+    work: ApplicationSqlTransactionWork<Value>,
+    queryBudget?: Partial<TransactionQueryBudget>
+  ) =>
+    session(sessionOptions, (active) =>
+      work(
+        applicationSqlSessionTransaction(
+          active,
+          sessionOptions.priority === 'background' || options.priority === 'background',
+          compileQuery,
+          queryBudget
+        )
+      )
+    )
+  return {
+    namespace,
+    // One statement is already atomic, so it needs no session round trips of
+    // its own: the durable object opens, admits, runs and closes a read session
+    // inside this single call. Cancellation only stops waiting for the answer,
+    // which is free to abandon because a read leaves nothing behind.
+    query: (sql, params = []) =>
+      raceAbort(
+        options.signal,
+        target.applicationSqlQuery(
+          sql,
+          params,
+          options.priority ? { priority: options.priority } : undefined
+        )
+      ),
+    exec: (sql, params = [], metadata) =>
+      session({}, (active) => active.exec(sql, params, metadata)),
+    registerTables: (tables) => session({}, (active) => active.registerTables(tables)),
+    transaction: (compileQuery, work, queryBudget) =>
+      transaction({}, compileQuery, work, queryBudget),
+    readTransaction: (compileQuery, work, queryBudget) =>
+      transaction({ readOnly: true }, compileQuery, work, queryBudget),
+  }
+}

@@ -1,0 +1,163 @@
+# The delegation model
+
+This is the central design decision of the rust sync host, and the thing that
+makes it a drop-in for zero-cache rather than a lookalike. A deployment picks
+one of two modes for where writes happen and where rows come from:
+
+- **local mutators**: the app's mutation logic is bundled into the sync host and
+  runs inside the engine's own SQLite. The host is the only writer.
+- **delegation** (`mutateUrl` plus `upstream`): the app's real push endpoint
+  owns writes against the upstream database, and the host replicates from that
+  database's change feed. This is the same split zero-cache uses.
+
+The two are mutually exclusive. `SyncHostConfig` requires exactly one of
+`mutators` or `mutateUrl`, and combining `mutators` with `upstream` is rejected
+outright. There is no dual-apply mode and no fallback chain
+(`packages/lime-sync-cf-host/src/config.ts`).
+
+## Why delegation exists
+
+In local-mutator mode the engine owns its store. Client pushes are applied by
+the host's mutator adapter inside the engine's SQLite, and pulls read that same
+store. That works, but it forces every consumer to bundle its mutation logic
+into the sync host, and it leaves anything that runs outside the host on a
+different database than the one clients read. Chat's server actions (unfurls,
+notifications, agent turns) and Contrast's projections and jobs write through the
+app, not through the sync host. In local-mutator mode those writes either fail
+closed or land in the wrong database.
+
+zero-cache never had this problem because it splits the roles. The app's real
+push endpoint owns writes against the upstream database, and the sync server
+replicates from that database. The directive for the rust engine was to support
+the same split, so an app can keep one real push endpoint and one real database
+and point the sync host at them. The design is written up in
+`plans/rust-sync-upstream-ingest.md`.
+
+## What the app owns
+
+In delegation mode the app worker owns authentication and writes. Those calls
+can cross a private service binding, so the host never holds app credentials.
+The app's ordinary Zero query registry is bundled directly into the sync host.
+
+### Authentication
+
+`config.authenticate(request, env)` runs at the worker edge and returns
+normalized claims (a stable `userID` plus whatever else the app puts in). The
+worker forwards those claims to the Durable Object on a binding-private header
+(`x-lime-sync-claims`) and strips it from anything inbound, so a client cannot
+forge claims. A common shape is to resolve the session over an APP service
+binding to the app's own auth, which keeps one source of truth for who a request
+belongs to.
+
+### Query definitions
+
+Clients send a named query plus arguments in their desired-queries patch.
+`config.queries` is the app's ordinary Zero `defineQueries` registry, the same
+object used to build the client. The host looks up each desired query and runs
+its `CustomQuery.fn` in-process before the AST reaches the engine. Authenticated
+claims are the query context, so argument validation and row-level permissions
+stay in the app's query definitions without an app endpoint or service-binding
+round trip.
+
+`config.queryTransformVersion` is a server-owned epoch. Bump it after a
+permission or schema change so every client's desired queries are treated as
+stale and resolved again.
+
+### Writes
+
+`config.mutateUrl` is a path on the upstream service (for example
+`/api/zero/push`). On a client push the host validates the body, then forwards
+it to `<upstreamPath><mutateUrl>` over the mutate binding
+(`config.mutateBinding`, defaulting to `upstream.binding`). It preserves the
+caller's exact body bytes and `Authorization` header, removes only its own
+private headers, and supplies the binding request host. The app endpoint then
+authenticates the original client token using the same binding-origin pattern as
+edge authentication. There is no host credential fallback
+(`plans/rust-sync-upstream-ingest.md`, resolved decisions).
+
+The host does not apply the mutation's rows locally. It records the
+last-mutation-id advance from the app's response, and the rows arrive separately
+through ingest.
+
+## Upstream ingest
+
+Ingest is the replication half. The engine keeps an upstream cursor
+(`upstreamWatermark`) alongside its own change-log watermark. On each ingest
+pass the host (`host.ts`, `#ingest`) pulls `<upstreamPath>/changes?watermark=<cursor>&limit=<changeLimit>`
+from the data worker over the DATA binding and feeds each page to
+`engine_apply_upstream` inside one engine transaction. `apply_upstream` is
+idempotent by watermark and advances the engine's change log exactly as a push
+does, so CVR-style diffing, cookies, and the wake fan-out all work unchanged.
+The loop continues until the feed reports it has caught up.
+
+The feed carries full row images: `rowData` is the complete row after an
+`INSERT` or `UPDATE`, and `oldData` is the complete prior row for a `DELETE`.
+Ingest binds those images directly and uses `oldData` only to remove a changed
+primary key or a deleted row.
+
+Each page also carries `oldestCommitTimeMs` from the already-selected change
+rows and `sourceTimeMs` from the data worker clock. The host brackets that
+request on its own clock to record `orez.replication.upstream_clock_skew`, then
+records `orez.sync.e2e_serving_lag` when active client groups have been served
+through the corresponding local version. A no-row advancement is a completion,
+not an omission; otherwise the metric degenerates into time since that group's
+last matching row. Negative lag is clamped to zero and counted by
+`orez.sync.e2e_serving_lag_clamps`.
+
+These instruments use the process-wide `@opentelemetry/api` meter provider.
+Register the Worker application's provider/exporter before constructing the sync
+host; when no provider is registered, the OpenTelemetry API intentionally uses
+its standard no-op provider.
+
+Ingest runs on four triggers:
+
+- a `POST /<namespace>/notify` from the data worker's fan-out (the immediate
+  path),
+- opportunistically before every pull,
+- immediately after each delegated push,
+- and a Durable Object alarm as a safety net (`upstream.intervalMs`, default 15
+  seconds).
+
+### Retention-gap recovery
+
+Retention gaps are explicit, not guessed. When the requested cursor precedes the
+data worker's retained floor, `/changes` returns HTTP 410 `watermarkTooOld`.
+The host then reads each modeled table through bounded keyset pages into a
+durable staged generation. An interrupted rebuild resumes from its recorded
+table and cursor. After paging, it replays `/changes` from the first page's
+watermark, atomically swaps the staged tables into place, and bumps the engine
+epoch so each client performs one full resync. The legacy single-response
+`/snapshot` remains for small datasets and older harnesses, but it is no longer
+the host's default rebuild path.
+
+## Last-mutation-id and row arrival are independent
+
+This is the subtle part, and it is deliberate. A successful app push response
+advances only the mutation IDs for the result entries the app actually returned.
+The host runs `engine_preflight` and `engine_finalize` per acknowledged mutation
+to advance the local last-mutation-id, and that is all it does with the push
+response. The rows themselves arrive exclusively through ingest. Because the two
+are decoupled, a retry that the app reports as already processed still repairs a
+missing local last-mutation-id acknowledgment, and a row that ingest has not yet
+delivered does not block the acknowledgment. This matches zero-cache's own
+confirmation model, where the poke fires when the ingest transaction lands.
+
+## What clients never see
+
+Ingest advances the engine's existing change log. It does not introduce a second
+cookie or watermark domain. Clients continue to see the engine's watermark as
+their cookie and never see upstream watermarks. From the client's point of view
+a delegated deployment and a local-mutator deployment are identical: they pull
+and push against the same surface and get the same cookie semantics.
+
+## Local-mutator mode, for completeness
+
+When a config supplies `mutators` instead of `mutateUrl`, the host runs the
+named mutator inside the push transaction against a transactional SQL adapter
+(`SqlStorageMutatorTransaction`), which can also run a validated Zero AST inside
+the same application transaction (`tx.queryAst`). Rows are written directly into
+the engine's SQLite, the last-mutation-id advances in the same transaction, and
+a change-log marker is appended so peers stop reporting `unchanged`. There is no
+upstream feed and no `/changes` consumption. This mode is the right one for a
+self-contained deployment whose entire write surface can live in the host, and
+it is what the conformance harness exercises by default.

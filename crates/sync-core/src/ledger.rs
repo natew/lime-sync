@@ -1,0 +1,586 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::db::{DbError, SqlValue, SyncDb};
+use crate::error::EngineError;
+
+// every change rewrites the whole active segment (sqlite has no in-place
+// append for a text value), so this bounds the bytes one change writes. 16 KiB
+// keeps that near 8 KiB on average, a couple of pages; at 768 KiB a native host
+// wrote ~400 KiB per row change and at 64 KiB ~32 KiB, doubled again by the wal
+// checkpoint. it only sets how the log
+// is chunked: retention prunes by version, and a pull at the head still reads
+// the one active row.
+pub(crate) const ROTATE_AT_BYTES: usize = 16 * 1_024;
+const MAX_PAYLOAD_BYTES: usize = 1_024 * 1_024;
+
+// bump when the packed payload shape changes; part of schema_revision so hosts
+// re-run the schema pass exactly once when a new format ships.
+pub const LEDGER_FORMAT: u8 = 2;
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LedgerTransaction {
+    version: String,
+    #[serde(default)]
+    changes: Vec<(String, Value)>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    reset: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LedgerPayload {
+    format: u8,
+    transactions: Vec<LedgerTransaction>,
+}
+
+// parsed for validation only: the set-based migration rewrites payloads in
+// sql, so these fields are deserialized to fail fast on a malformed legacy
+// payload rather than read. the per-transaction `lmid` key survives the
+// in-place rewrite; format-2 parsing ignores it and the next payload
+// rewrite drops it.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct LegacyLedgerTransaction {
+    version: String,
+    #[serde(default)]
+    changes: Vec<(String, Value)>,
+    #[serde(default, rename = "lmid")]
+    _lmid: Option<Value>,
+    #[serde(default)]
+    reset: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyLedgerPayload {
+    format: u8,
+    lmids: BTreeMap<String, BTreeMap<String, String>>,
+    #[allow(dead_code)]
+    transactions: Vec<LegacyLedgerTransaction>,
+}
+
+struct ActiveSegment {
+    start: i64,
+    end: i64,
+    payload: LedgerPayload,
+    pending: Vec<(String, Value)>,
+    capture_mode: i64,
+}
+
+fn text(value: impl Into<String>) -> SqlValue {
+    SqlValue::Text(value.into())
+}
+
+fn parse_counter(value: Option<&SqlValue>, name: &str) -> Result<i64, EngineError> {
+    match value {
+        Some(SqlValue::Integer(value)) if *value >= 0 => Ok(*value),
+        Some(SqlValue::Text(value)) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| EngineError::internal(format!("packed ledger {name} is invalid"))),
+        _ => Err(EngineError::internal(format!(
+            "packed ledger {name} is invalid"
+        ))),
+    }
+}
+
+fn parse_payload(value: Option<&SqlValue>) -> Result<LedgerPayload, EngineError> {
+    let Some(SqlValue::Text(value)) = value else {
+        return Err(EngineError::internal("packed ledger payload is not text"));
+    };
+    let payload: LedgerPayload = serde_json::from_str(value)
+        .map_err(|_| EngineError::internal("packed ledger payload is invalid JSON"))?;
+    if payload.format != LEDGER_FORMAT {
+        return Err(EngineError::internal("packed ledger format is unsupported"));
+    }
+    Ok(payload)
+}
+
+fn active(db: &mut dyn SyncDb) -> Result<ActiveSegment, EngineError> {
+    let rows = db.query(
+        "SELECT CAST(startVersion AS TEXT) AS startVersion,
+                CAST(endVersion AS TEXT) AS endVersion,
+                payload, pending, CAST(captureMode AS TEXT) AS captureMode
+         FROM _zsync_log_segments AS segment
+         WHERE segment.startVersion = (
+           SELECT MAX(startVersion) FROM _zsync_log_segments
+         )",
+        &[],
+    )?;
+    let Some(row) = rows.first() else {
+        return Err(EngineError::internal("packed ledger has no active segment"));
+    };
+    let pending = match row.get("pending") {
+        Some(SqlValue::Text(value)) => serde_json::from_str(value)
+            .map_err(|_| EngineError::internal("packed ledger pending keys are invalid"))?,
+        _ => {
+            return Err(EngineError::internal(
+                "packed ledger pending keys are not text",
+            ));
+        }
+    };
+    Ok(ActiveSegment {
+        start: parse_counter(row.get("startVersion"), "start version")?,
+        end: parse_counter(row.get("endVersion"), "end version")?,
+        payload: parse_payload(row.get("payload"))?,
+        pending,
+        capture_mode: parse_counter(row.get("captureMode"), "capture mode")?,
+    })
+}
+
+fn encoded_payload(payload: &LedgerPayload) -> Result<String, EngineError> {
+    serde_json::to_string(payload)
+        .map_err(|_| EngineError::internal("packed ledger payload cannot be encoded"))
+}
+
+fn rotate_if_full(
+    db: &mut dyn SyncDb,
+    segment: ActiveSegment,
+) -> Result<ActiveSegment, EngineError> {
+    if encoded_payload(&segment.payload)?.len() < ROTATE_AT_BYTES {
+        return Ok(segment);
+    }
+    if segment.capture_mode != 0 || !segment.pending.is_empty() {
+        return Err(EngineError::internal(
+            "packed ledger cannot rotate with uncommitted capture state",
+        ));
+    }
+    if segment.end == i64::MAX {
+        return Err(EngineError::internal(
+            "packed ledger version space is exhausted",
+        ));
+    }
+    let payload = encoded_payload(&LedgerPayload {
+        format: LEDGER_FORMAT,
+        transactions: Vec::new(),
+    })?;
+    db.exec(
+        "INSERT INTO _zsync_log_segments
+           (startVersion, endVersion, payload, pending, captureMode)
+         VALUES (?, ?, ?, '[]', 0)",
+        &[
+            SqlValue::Integer(segment.end + 1),
+            SqlValue::Integer(segment.end),
+            text(payload),
+        ],
+    )?;
+    active(db)
+}
+
+pub(crate) fn init(db: &mut dyn SyncDb) -> Result<(), DbError> {
+    let legacy_table = !db
+        .query(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_zsync_changes'",
+            &[],
+        )?
+        .is_empty();
+    let legacy_head = if legacy_table {
+        let rows = db.query(
+            "SELECT CAST(COALESCE(MAX(watermark), 0) AS TEXT) AS watermark
+             FROM _zsync_changes",
+            &[],
+        )?;
+        match rows.first().and_then(|row| row.get("watermark")) {
+            Some(SqlValue::Text(value)) => value.parse::<i64>().map_err(|_| {
+                DbError("legacy watermark is invalid while creating packed ledger".into())
+            })?,
+            Some(SqlValue::Integer(value)) => *value,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS _zsync_log_segments (
+            startVersion INTEGER PRIMARY KEY,
+            endVersion INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            pending TEXT NOT NULL,
+            captureMode INTEGER NOT NULL CHECK (captureMode IN (0, 1))
+         ) WITHOUT ROWID",
+        &[],
+    )?;
+    // read only the active segment here: this runs on every schema pass, and
+    // scanning every retained payload belongs to the format-1 migration alone.
+    // captureMode rides along on the row we already read, so the residue check
+    // below costs nothing on a settled namespace.
+    let active_row = db.query(
+        "SELECT payload, CAST(captureMode AS TEXT) AS captureMode
+         FROM _zsync_log_segments
+         WHERE startVersion = (SELECT MAX(startVersion) FROM _zsync_log_segments)",
+        &[],
+    )?;
+    if active_row.is_empty() {
+        let durable_head = db.query(
+            "SELECT CAST(high AS TEXT) AS watermark FROM _zsync_watermark WHERE lock = 1",
+            &[],
+        )?;
+        let durable_head = match durable_head.first().and_then(|row| row.get("watermark")) {
+            Some(SqlValue::Text(value)) => value.parse::<i64>().map_err(|_| {
+                DbError("durable watermark is invalid while creating packed ledger".into())
+            })?,
+            Some(SqlValue::Integer(value)) => *value,
+            _ => 0,
+        };
+        let head = legacy_head.max(durable_head);
+        let payload = serde_json::to_string(&LedgerPayload {
+            format: LEDGER_FORMAT,
+            transactions: Vec::new(),
+        })
+        .map_err(|error| DbError(error.to_string()))?;
+        db.exec(
+            "INSERT INTO _zsync_log_segments
+           (startVersion, endVersion, payload, pending, captureMode)
+         VALUES (?, ?, ?, '[]', 0)",
+            &[
+                SqlValue::Integer(head + 1),
+                SqlValue::Integer(head),
+                text(payload),
+            ],
+        )?;
+    } else {
+        let active_payload = match active_row.first().and_then(|row| row.get("payload")) {
+            Some(SqlValue::Text(value)) => value,
+            _ => return Err(DbError("packed ledger payload is not text".into())),
+        };
+        let format = serde_json::from_str::<Value>(active_payload)
+            .ok()
+            .and_then(|payload| payload.get("format").and_then(Value::as_u64))
+            .ok_or_else(|| DbError("packed ledger payload has an unknown shape".into()))?;
+        match format {
+            format if format == u64::from(LEDGER_FORMAT) => {}
+            1 => {
+                let active: LegacyLedgerPayload = serde_json::from_str(active_payload)
+                    .map_err(|_| DbError("packed ledger payload has an unknown shape".into()))?;
+                if active.format != 1 {
+                    return Err(DbError("packed ledger payload has an unknown shape".into()));
+                }
+                // validate every lmid before writing anything, matching the
+                // row-by-row parse this replaces: a value that is not a
+                // non-negative integer fails the migration instead of CASTing
+                // to a silently wrong number.
+                for clients in active.lmids.values() {
+                    for mutation in clients.values() {
+                        mutation
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|value| *value >= 0)
+                            .ok_or_else(|| DbError("legacy client lmid is invalid".into()))?;
+                    }
+                }
+                // every retained payload must be a known format before the
+                // set-based rewrite below silently skips non-format-1 rows.
+                if !db
+                    .query(
+                        "SELECT 1 FROM _zsync_log_segments
+                         WHERE CAST(json_extract(payload, '$.format') AS INTEGER)
+                               NOT IN (1, 2)
+                         LIMIT 1",
+                        &[],
+                    )
+                    .map_err(|_| DbError("packed ledger payload has an unknown shape".into()))?
+                    .is_empty()
+                {
+                    return Err(DbError("packed ledger payload has an unknown shape".into()));
+                }
+                // the whole active lmids map lands in one set-based statement.
+                // the row-per-client loop this replaces paid one engine->sql
+                // crossing per client, which timed a 12k-client production
+                // namespace out of every push budget; sqlite walks the payload
+                // json itself in milliseconds.
+                db.exec(
+                    "INSERT INTO _zsync_clients
+                       (clientGroupID, clientID, lastMutationID, userID)
+                     SELECT grp.key, client.key, CAST(client.value AS INTEGER), NULL
+                     FROM _zsync_log_segments segment,
+                          json_each(segment.payload, '$.lmids') grp,
+                          json_each(grp.value) client
+                     WHERE segment.startVersion =
+                           (SELECT MAX(startVersion) FROM _zsync_log_segments)
+                     ON CONFLICT (clientGroupID, clientID)
+                     DO UPDATE SET lastMutationID = excluded.lastMutationID",
+                    &[],
+                )?;
+                // one rewrite strips lmids and stamps format 2 across every
+                // retained format-1 segment. transactions are carried verbatim:
+                // both formats serialize the same {version, changes, reset?}
+                // entries, and the parsers ignore unknown fields.
+                db.exec(
+                    "UPDATE _zsync_log_segments
+                     SET payload = json_remove(json_set(payload, '$.format', 2), '$.lmids')
+                     WHERE CAST(json_extract(payload, '$.format') AS INTEGER) = 1",
+                    &[],
+                )?;
+            }
+            _ => return Err(DbError("packed ledger format is unsupported".into())),
+        }
+        // a committed captureMode = 1 is orphaned capture state. the executor
+        // toggles the column through plain sql mid-transaction, so a delegated
+        // push abandoned before commit or rollback used to leave it set
+        // forever: every later push then failed preflight with "uncommitted
+        // capture state", and on this path the trigger bodies (gated on
+        // captureMode = 0) silently dropped the next write's change envelope
+        // while still writing its row. the tx journal restores the column on
+        // session disposal now, so anything still set at a schema pass belongs
+        // to a namespace wedged before that landed and no live writer owns it.
+        //
+        // one exception: while a transaction is journaled in flight, the toggle
+        // is that transaction's, and its commit or rollback (not this pass)
+        // resolves it. `_orez_tx_manifest` rows exist exactly until a
+        // transaction commits, so their absence is the proof that no writer is
+        // mid-flight; a host that keeps no journal has no such writer either.
+        let capture_mode = parse_counter(
+            active_row.first().and_then(|row| row.get("captureMode")),
+            "capture mode",
+        )
+        .map_err(|error| DbError(error.message))?;
+        if capture_mode != 0 {
+            let journaling = !db
+                .query(
+                    "SELECT 1 FROM sqlite_schema
+                     WHERE type = 'table' AND name = '_orez_tx_manifest'",
+                    &[],
+                )?
+                .is_empty();
+            let in_flight = journaling
+                && !db
+                    .query("SELECT 1 FROM _orez_tx_manifest LIMIT 1", &[])?
+                    .is_empty();
+            if !in_flight {
+                db.exec(
+                    "UPDATE _zsync_log_segments SET captureMode = 0
+                     WHERE startVersion = (SELECT MAX(startVersion) FROM _zsync_log_segments)",
+                    &[],
+                )?;
+            }
+        }
+    }
+    if legacy_table {
+        db.exec(
+            "UPDATE _zsync_watermark SET high = MAX(high, ?) WHERE lock = 1",
+            &[SqlValue::Integer(legacy_head)],
+        )?;
+        db.exec(
+            "UPDATE _zsync_meta SET floor = MAX(floor, ?) WHERE lock = 1",
+            &[SqlValue::Integer(legacy_head)],
+        )?;
+        db.exec("DROP TABLE _zsync_changes", &[])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn watermark(db: &mut dyn SyncDb) -> Result<i64, EngineError> {
+    // the active segment's end is the watermark: segments form one contiguous
+    // chain (scan_since rejects gaps), so the last row's end is the max end.
+    // two primary-key descents instead of MAX(endVersion), which has no index
+    // and walks every retained payload (release micro-bench, 400 ~14 KiB
+    // segments: 3.84ms -> 0.46ms per read). an empty table reads 0, as before.
+    let segment = db.query(
+        "SELECT CAST(endVersion AS TEXT) AS watermark
+         FROM _zsync_log_segments
+         WHERE startVersion = (SELECT MAX(startVersion) FROM _zsync_log_segments)",
+        &[],
+    )?;
+    match segment.first() {
+        None => Ok(0),
+        Some(row) => parse_counter(row.get("watermark"), "watermark"),
+    }
+}
+
+pub(crate) fn finalize(
+    db: &mut dyn SyncDb,
+    identity: Option<(&str, &str, i64)>,
+    reset: bool,
+) -> Result<i64, EngineError> {
+    let mut segment = active(db)?;
+    if segment.end == i64::MAX {
+        return Err(EngineError::internal(
+            "packed ledger version space is exhausted",
+        ));
+    }
+    let mut changes = BTreeMap::new();
+    for (table, key) in segment.pending.drain(..) {
+        let encoded = serde_json::to_string(&(table.clone(), &key))
+            .map_err(|_| EngineError::internal("packed ledger key is invalid"))?;
+        changes.insert(encoded, (table, key));
+    }
+    if identity.is_none() && changes.is_empty() && !reset {
+        if segment.capture_mode != 0 {
+            db.exec(
+                "UPDATE _zsync_log_segments SET captureMode = 0
+                 WHERE startVersion = ?",
+                &[SqlValue::Integer(segment.start)],
+            )?;
+        }
+        return Ok(segment.end);
+    }
+    segment = rotate_if_full(db, segment)?;
+    let version = segment.end + 1;
+    if let Some((group, client, mutation)) = identity {
+        db.exec(
+            "UPDATE _zsync_clients SET lastMutationID = ?
+             WHERE clientGroupID = ? AND clientID = ?",
+            &[SqlValue::Integer(mutation), text(group), text(client)],
+        )?;
+    }
+    segment.payload.transactions.push(LedgerTransaction {
+        version: version.to_string(),
+        changes: changes.into_values().collect(),
+        reset,
+    });
+    let payload = encoded_payload(&segment.payload)?;
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return Err(EngineError::internal(
+            "packed ledger transaction exceeds the 1 MiB limit",
+        ));
+    }
+    db.exec(
+        "UPDATE _zsync_log_segments
+         SET endVersion = ?, payload = ?, pending = '[]', captureMode = 0
+         WHERE startVersion = ?",
+        &[
+            SqlValue::Integer(version),
+            text(payload),
+            SqlValue::Integer(segment.start),
+        ],
+    )?;
+    Ok(version)
+}
+
+pub(crate) struct ScannedLedger {
+    pub changes: BTreeSet<(String, String)>,
+    // a reset transaction after the cookie invalidated every replica
+    pub reset: bool,
+}
+
+pub(crate) fn scan_since(db: &mut dyn SyncDb, cookie: i64) -> Result<ScannedLedger, EngineError> {
+    // primary-key range over the contiguous chain instead of `endVersion > ?`,
+    // which has no index and walks every retained payload to filter it. the
+    // subquery finds the one segment holding cookie + 1 (or none, when the
+    // cookie predates retention); the outer walk then covers exactly the
+    // overlapping segments plus at most one fully-old one, whose transactions
+    // the version check below skips. error behavior is unchanged: with no
+    // segment at or before cookie + 1 the first row starts past it and the
+    // leading-gap check fires exactly as before.
+    let rows = db.query(
+        "SELECT CAST(startVersion AS TEXT) AS startVersion,
+                CAST(endVersion AS TEXT) AS endVersion, payload
+         FROM _zsync_log_segments AS segment
+         WHERE segment.startVersion >= (
+           SELECT COALESCE(MAX(startVersion), -1)
+           FROM _zsync_log_segments
+           WHERE startVersion <= ?
+         )
+         ORDER BY segment.startVersion",
+        &[SqlValue::Integer(cookie.saturating_add(1))],
+    )?;
+    let mut changes = BTreeSet::new();
+    let mut reset = false;
+    let mut previous_end: Option<i64> = None;
+    for row in rows {
+        let start = parse_counter(row.get("startVersion"), "start version")?;
+        let end = parse_counter(row.get("endVersion"), "end version")?;
+        if start > end.saturating_add(1) {
+            return Err(EngineError::internal(
+                "packed ledger segment bounds are invalid",
+            ));
+        }
+        if let Some(previous_end) = previous_end {
+            let expected = previous_end
+                .checked_add(1)
+                .ok_or_else(|| EngineError::internal("packed ledger version space is exhausted"))?;
+            if start != expected {
+                return Err(EngineError::internal(
+                    "packed ledger segment chain has a gap",
+                ));
+            }
+        } else if start > cookie.saturating_add(1) {
+            return Err(EngineError::internal(
+                "packed ledger segment chain has a leading gap",
+            ));
+        }
+        let payload = parse_payload(row.get("payload"))?;
+        let had_transactions = !payload.transactions.is_empty();
+        let mut previous_version = start.saturating_sub(1);
+        for transaction in payload.transactions {
+            let version = transaction
+                .version
+                .parse::<i64>()
+                .map_err(|_| EngineError::internal("packed ledger version is invalid"))?;
+            if version < start || version > end || version <= previous_version {
+                return Err(EngineError::internal(
+                    "packed ledger transaction order is invalid",
+                ));
+            }
+            previous_version = version;
+            if version <= cookie {
+                continue;
+            }
+            reset |= transaction.reset;
+            for (table, key) in transaction.changes {
+                let key = serde_json::to_string(&key)
+                    .map_err(|_| EngineError::internal("packed ledger key is invalid"))?;
+                changes.insert((table, key));
+            }
+        }
+        if had_transactions && previous_version != end {
+            return Err(EngineError::internal(
+                "packed ledger segment end does not match its last transaction",
+            ));
+        }
+        previous_end = Some(end);
+    }
+    Ok(ScannedLedger { changes, reset })
+}
+
+pub(crate) fn prune(db: &mut dyn SyncDb, cutoff: i64) -> Result<(), EngineError> {
+    // prefix drain one primary-key row at a time: ends increase along the
+    // contiguous chain, so the stale rows are exactly the oldest ones and the
+    // first live oldest ends the prefix. each pass costs two key descents
+    // plus one point delete — never a walk over the retained payloads (a
+    // WITHOUT ROWID leaf holds the full record, so even a "narrow" full walk
+    // pages every payload; the old single DELETE filtered on the unindexed
+    // endVersion and did exactly that on each prune, which is nearly every
+    // pull on a busy namespace). the loop keeps the old one-shot
+    // postcondition on a contiguous chain; on a gapped (corrupt) one it keeps
+    // more than the old predicate, which scan_since reports as a gap on the
+    // next read either way. the active last row is spared, as before.
+    loop {
+        let oldest = db.query(
+            "SELECT CAST(startVersion AS TEXT) AS startVersion,
+                    CAST(endVersion AS TEXT) AS endVersion
+             FROM _zsync_log_segments
+             WHERE startVersion = (SELECT MIN(startVersion) FROM _zsync_log_segments)",
+            &[],
+        )?;
+        let Some(row) = oldest.first() else {
+            return Ok(());
+        };
+        let start = parse_counter(row.get("startVersion"), "start version")?;
+        let end = parse_counter(row.get("endVersion"), "end version")?;
+        if end > cutoff {
+            return Ok(());
+        }
+        let newest = db.query(
+            "SELECT CAST(MAX(startVersion) AS TEXT) AS startVersion FROM _zsync_log_segments",
+            &[],
+        )?;
+        let max_start = parse_counter(
+            newest.first().and_then(|row| row.get("startVersion")),
+            "start version",
+        )?;
+        if start >= max_start {
+            return Ok(());
+        }
+        db.exec(
+            "DELETE FROM _zsync_log_segments WHERE startVersion = ? AND endVersion <= ?",
+            &[SqlValue::Integer(start), SqlValue::Integer(cutoff)],
+        )?;
+    }
+}

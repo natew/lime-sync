@@ -1,0 +1,211 @@
+SHELL := /bin/bash
+
+# bedrock sqlite source from @rocicorp/zero-sqlite3
+ZERO_SQLITE3_DIR ?= ../node_modules/@rocicorp/zero-sqlite3/deps/sqlite3
+SQLITE_SRC_FILES = sqlite-src/sqlite3.c sqlite-src/sqlite3.h
+
+JS_PRE_FILES = native/api.js native/vfs-pre.js
+JS_LIB_FILES = native/vfs.js
+OBJECT_FILES = build/sqlite3.o build/vfs.o build/sqlite-vec.o build/sqlite-vec-init.o build/better-trigram.o build/fts5-html.o build/lexbor.a
+EXPORTED_FUNCS_JSON = build/exp_funcs.json
+
+# upstream sqlite-vec v0.1.9 amalgamation, also used by nitro sqlite vec 10.1.0
+SQLITE_VEC_URL = https://github.com/asg017/sqlite-vec/releases/download/v0.1.9/sqlite-vec-0.1.9-amalgamation.tar.gz
+SQLITE_VEC_SHA256 = 3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61
+
+# exact native sources from the original Notesnook app, including its Lexbor copy.
+# extract new C/header files only; never apply its SQLite or bridge patches.
+FTS_APP_PIN = 5748795b9920a4ba71f5456e126f5227bd5b8a51
+FTS_PATCH_URL = https://raw.githubusercontent.com/streetwriters/notesnook/$(FTS_APP_PIN)/apps/mobile/patches/react-native-quick-sqlite+8.2.7.patch
+FTS_PATCH_SHA256 = 3cc27458802c4897114d3162b9d18869eec586dff08635c31185938ee490868c
+
+# compile flags — bedrock-sqlite is shared by zero-cache and the soot
+# compat sqlite stubs (op-sqlite, expo-sqlite, nitro-sqlite,
+# react-native-sqlite-storage). joplin and other real-world RN apps need
+# FTS4 for their notes_fts virtual table during schema migration;
+# without it `CREATE VIRTUAL TABLE notes_fts USING fts4(...)` fails with
+# "no such module: fts4", which rolls back the whole migration and
+# surfaces as confusing "no such table: notes_normalized" errors to
+# consumers. RTREE is similarly required by some demo apps for spatial
+# queries. FTS3 ships with FTS4 (same module).
+# still removed (unused): GEOPOLY, SOUNDEX, DBSTAT, UPDATE_DELETE_LIMIT.
+SQLITE_FLAGS = \
+	-DSQLITE_EXTRA_INIT=bedrock_sqlite_init \
+	-DSQLITE_DEFAULT_CACHE_SIZE=-2000 \
+	-DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
+	-DSQLITE_DEFAULT_MEMSTATUS=0 \
+	-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 \
+	-DSQLITE_DQS=0 \
+	-DSQLITE_ENABLE_COLUMN_METADATA \
+	-DSQLITE_ENABLE_DESERIALIZE \
+	-DSQLITE_ENABLE_FTS3 \
+	-DSQLITE_ENABLE_FTS3_PARENTHESIS \
+	-DSQLITE_ENABLE_FTS4 \
+	-DSQLITE_ENABLE_FTS5 \
+	-DSQLITE_ENABLE_JSON1 \
+	-DSQLITE_ENABLE_MATH_FUNCTIONS \
+	-DSQLITE_ENABLE_RTREE \
+	-DSQLITE_ENABLE_STAT4 \
+	-DSQLITE_ENABLE_STMT_SCANSTATUS \
+	-DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
+	-DSQLITE_OMIT_DEPRECATED \
+	-DSQLITE_OMIT_LOAD_EXTENSION \
+	-DSQLITE_OMIT_PROGRESS_CALLBACK \
+	-DSQLITE_OMIT_SHARED_CACHE \
+	-DSQLITE_OMIT_TCL_VARIABLE \
+	-DSQLITE_THREADSAFE=0 \
+	-DSQLITE_TRACE_SIZE_LIMIT=32 \
+	-DSQLITE_USE_URI=0 \
+	-DSQLITE_TEMP_STORE=3 \
+	-DSQLITE_OS_OTHER=1
+
+EM_FLAGS = -O3 -flto
+
+LINK_FLAGS = \
+	-s EXPORTED_FUNCTIONS=@$(EXPORTED_FUNCS_JSON) \
+	-s EXPORTED_RUNTIME_METHODS=cwrap,addFunction,removeFunction \
+	-s NODEJS_CATCH_EXIT=0 \
+	-s NODEJS_CATCH_REJECTION=0 \
+	-s MODULARIZE=0 \
+	-s ALLOW_TABLE_GROWTH=1 \
+	-s ALLOW_MEMORY_GROWTH=1 \
+	-s MAXIMUM_MEMORY=536870912 \
+	-s ENVIRONMENT=node \
+	-s FILESYSTEM=0 \
+	-s WASM_BIGINT \
+	-s WASM_ASYNC_COMPILATION=0
+
+all: dist/sqlite3.js dist/sqlite3-async.js dist/package.json
+
+# browser build: in-memory VFS, web+worker environment
+browser: dist/sqlite3-browser.js
+
+JS_PRE_FILES_BROWSER = native/api.js native/vfs-pre-browser.js
+JS_LIB_FILES_BROWSER = native/vfs-memfs.js
+
+# browser build: async factory — enables WebAssembly.compileStreaming() + V8 caching
+LINK_FLAGS_BROWSER = \
+	-s EXPORTED_FUNCTIONS=@$(EXPORTED_FUNCS_JSON) \
+	-s EXPORTED_RUNTIME_METHODS=cwrap,addFunction,removeFunction,getValue,setValue \
+	-s NODEJS_CATCH_EXIT=0 \
+	-s NODEJS_CATCH_REJECTION=0 \
+	-s MODULARIZE=1 \
+	-s EXPORT_NAME=createSqliteModule \
+	-s EXPORT_ES6=1 \
+	-s ALLOW_TABLE_GROWTH=1 \
+	-s ALLOW_MEMORY_GROWTH=1 \
+	-s MAXIMUM_MEMORY=536870912 \
+	-s ENVIRONMENT=web,worker \
+	-s FILESYSTEM=0 \
+	-s WASM_BIGINT \
+	-s WASM_ASYNC_COMPILATION=1
+
+dist/sqlite3-browser.js: $(OBJECT_FILES) $(EXPORTED_FUNCS_JSON) $(JS_PRE_FILES_BROWSER) $(JS_LIB_FILES_BROWSER)
+	mkdir -p dist
+	emcc $(LINK_FLAGS_BROWSER) $(EM_FLAGS) $(OBJECT_FILES) --js-library $(JS_LIB_FILES_BROWSER) \
+		$(foreach f,$(JS_PRE_FILES_BROWSER),--pre-js $(f)) -o $@
+
+# node async build: factory function with async WASM compilation.
+# shares the same .wasm binary as the sync build.
+# usage: const mod = await createSqliteModule()
+LINK_FLAGS_ASYNC = \
+	-s EXPORTED_FUNCTIONS=@$(EXPORTED_FUNCS_JSON) \
+	-s EXPORTED_RUNTIME_METHODS=cwrap,addFunction,removeFunction \
+	-s NODEJS_CATCH_EXIT=0 \
+	-s NODEJS_CATCH_REJECTION=0 \
+	-s MODULARIZE=1 \
+	-s EXPORT_NAME=createSqliteModule \
+	-s ALLOW_TABLE_GROWTH=1 \
+	-s ALLOW_MEMORY_GROWTH=1 \
+	-s MAXIMUM_MEMORY=536870912 \
+	-s ENVIRONMENT=node \
+	-s FILESYSTEM=0 \
+	-s WASM_BIGINT \
+	-s WASM_ASYNC_COMPILATION=1
+
+dist/sqlite3.js: $(OBJECT_FILES) $(EXPORTED_FUNCS_JSON) $(JS_PRE_FILES) $(JS_LIB_FILES)
+	mkdir -p dist
+	emcc $(LINK_FLAGS) $(EM_FLAGS) $(OBJECT_FILES) --js-library $(JS_LIB_FILES) \
+		$(foreach f,$(JS_PRE_FILES),--pre-js $(f)) -o $@
+
+dist/sqlite3-async.js: $(OBJECT_FILES) $(EXPORTED_FUNCS_JSON) $(JS_PRE_FILES) $(JS_LIB_FILES)
+	mkdir -p dist
+	emcc $(LINK_FLAGS_ASYNC) $(EM_FLAGS) $(OBJECT_FILES) --js-library $(JS_LIB_FILES) \
+		$(foreach f,$(JS_PRE_FILES),--pre-js $(f)) -o $@
+	@# rewrite .wasm reference to share the sync build's binary
+	sed -i.bak 's/sqlite3-async\.wasm/sqlite3.wasm/g' $@ && rm -f $@.bak
+	rm -f dist/sqlite3-async.wasm
+
+# force CJS so __dirname is available for wasm file path resolution
+dist/package.json:
+	mkdir -p dist
+	echo '{"type": "commonjs"}' > $@
+
+build/sqlite3.o: $(SQLITE_SRC_FILES) Makefile
+	mkdir -p build
+	emcc $(EM_FLAGS) $(SQLITE_FLAGS) -c $< -o $@
+
+build/vfs.o: native/vfs.c sqlite-src/sqlite3.h Makefile
+	mkdir -p build
+	emcc $(EM_FLAGS) $(SQLITE_FLAGS) -I sqlite-src -c $< -o $@
+
+build/sqlite-vec/.ready: Makefile
+	mkdir -p build/sqlite-vec
+	curl -fsSL $(SQLITE_VEC_URL) -o build/sqlite-vec.tar.gz
+	echo '$(SQLITE_VEC_SHA256)  build/sqlite-vec.tar.gz' | sha256sum -c -
+	tar -xzf build/sqlite-vec.tar.gz -C build/sqlite-vec
+	touch $@
+
+build/sqlite-vec.o: build/sqlite-vec/.ready sqlite-src/sqlite3.h
+	emcc $(EM_FLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC -I sqlite-src -c build/sqlite-vec/sqlite-vec.c -o $@
+
+build/sqlite-vec-init.o: native/sqlite-vec-init.c build/sqlite-vec/.ready sqlite-src/sqlite3.h
+	emcc $(EM_FLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC -I sqlite-src -I build/sqlite-vec -c $< -o $@
+
+build/fts/.ready: Makefile
+	rm -rf build/fts
+	mkdir -p build/fts
+	curl -fsSL $(FTS_PATCH_URL) -o build/fts.patch
+	echo '$(FTS_PATCH_SHA256)  build/fts.patch' | sha256sum -c -
+	cd build/fts && GIT_CEILING_DIRECTORIES='$(CURDIR)/build' git apply -p3 --whitespace=nowarn \
+		$(foreach dir,better-trigram sqlite3-fts5-html lexbor,$(foreach ext,c h,--include='$(dir)/*.$(ext)')) ../fts.patch
+	touch $@
+
+build/better-trigram.o: build/fts/.ready sqlite-src/sqlite3.h Makefile
+	emcc $(EM_FLAGS) -DSQLITE_CORE -DSQLITE_PRIVATE= -I sqlite-src -c build/fts/better-trigram/better-trigram.c -o $@
+
+build/fts5-html.o: build/fts/.ready sqlite-src/sqlite3.h Makefile
+	emcc $(EM_FLAGS) -DSQLITE_CORE -DSQLITE_PRIVATE= -I sqlite-src -I build/fts -c build/fts/sqlite3-fts5-html/fts5-html.c -o $@
+
+build/lexbor.a: build/fts/.ready Makefile
+	rm -rf build/lexbor
+	rm -f $@
+	mkdir -p build/lexbor
+	while read -r source; do \
+		object="build/lexbor/$${source#build/fts/lexbor/}"; \
+		mkdir -p "$$(dirname "$$object")"; \
+		emcc $(EM_FLAGS) -DLEXBOR_STATIC -I build/fts -c "$$source" -o "$${object%.c}.o" || exit; \
+	done < <(find build/fts/lexbor -name '*.c' ! -path '*/ports/windows_nt/*' | LC_ALL=C sort)
+	emar rcs $@ $$(find build/lexbor -name '*.o' | LC_ALL=C sort)
+
+$(EXPORTED_FUNCS_JSON): native/api.js
+	mkdir -p build
+	echo '[' > $@
+	perl -p0e 's/.*signatures = \{\n(.+?)\s*\}.*/\1/smg' native/api.js | \
+		perl -pe 's/\s*(.+):.*/"_sqlite3_\1"/' | \
+		paste -sd "," - >> $@
+	echo ',"_malloc","_free"]' >> $@
+
+# copy bedrock sqlite source from zero-sqlite3
+$(SQLITE_SRC_FILES):
+	mkdir -p sqlite-src
+	cp $(ZERO_SQLITE3_DIR)/$(@F) $@
+
+.PHONY: clean
+clean:
+	rm -rf build dist sqlite-src
+
+.PHONY: docker
+docker:
+	docker run --rm -v $$(pwd)/..:$$(pwd)/.. -w $$(pwd) -u $$(id -u):$$(id -g) \
+		emscripten/emsdk:5.0.0 make all browser

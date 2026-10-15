@@ -1,0 +1,33 @@
+{
+  "name": "lime-sync-native",
+  "version": "0.1.6",
+  "description": "Prebuilt generic Orez sync host for application-owned callbacks",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natew/lime-sync.git"
+  },
+  "bin": {
+    "sync-native": "bin/sync-native.cjs"
+  },
+  "exports": {
+    "./launcher": "./bin/sync-native.cjs",
+    "./port-check": "./bin/port-check.cjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "optionalDependencies": {
+    "lime-sync-native-darwin-arm64": "workspace:*",
+    "lime-sync-native-darwin-x64": "workspace:*",
+    "lime-sync-native-linux-arm64-gnu": "workspace:*",
+    "lime-sync-native-linux-arm64-musl": "workspace:*",
+    "lime-sync-native-linux-x64-gnu": "workspace:*",
+    "lime-sync-native-linux-x64-musl": "workspace:*",
+    "lime-sync-native-win32-arm64": "workspace:*",
+    "lime-sync-native-win32-x64": "workspace:*"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

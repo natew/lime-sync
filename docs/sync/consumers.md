@@ -1,0 +1,272 @@
+# Consumers and integration guide
+
+Two real apps run on the sync host, and both now use delegated push with
+upstream ingest: mutations run in the app worker and the host replicates the
+committed rows from the data feed. Reading both is the fastest way to understand
+the choice you make when you integrate a new app. (Local mutators, where the
+host runs writes inside the Durable Object, remain a supported composition mode;
+Chat used it before upstream ingest existed and has since migrated.)
+
+- **Chat** (start.chat, live) uses delegated push with upstream ingest.
+- **Contrast** (mid-cutover) uses delegated push with upstream ingest.
+
+Both pass the same Zero query registry used by their clients into
+`config.queries`. The host resolves desired named queries in-process, with
+authenticated claims as the query context.
+
+## Chat: delegated push with upstream ingest
+
+Chat's integration lives in its `rust-sync/` directory, split into
+`chat-config/` (the registry) and `chat-host/` (the workerd composition and
+wrangler). The config is a single exported object (`rust-sync/chat-config/index.ts`):
+
+```ts
+export const chatConfig: SyncHostConfig = {
+  hostVersion: 'chat-rust-sync-0.1',
+  schema: chatSchema,
+  queries: appQueries,
+  queryTransformVersion: 1,
+  mutateUrl: '/api/zero/push?schema=chat_0&appID=chat', // delegated push
+  mutateBinding: 'APP',
+  upstream: {
+    binding: 'DATA',
+    namespacePath: upstreamPathForNamespace, // ns -> /control or /proj-<serverId>
+  },
+  initialize(sql) {
+    initializeChatSchema(sql)
+  },
+  async authenticate(request, env) {
+    /* resolve better-auth session over APP */
+  },
+  namespace(request) {
+    return namespaceForRequest(request) // env-isolated: staging:control, production:p-<serverId>
+  },
+}
+```
+
+The pieces:
+
+- **Push is delegated.** The host forwards the Zero push to the Chat app's real
+  `/api/zero/push` over the `APP` binding. Chat's application mutators and server
+  actions remain the sole write authority; the host bundles no local mutator
+  registry. Committed rows return through **upstream ingest** — the host consumes
+  `/snapshot` and `/changes` from the paired data worker over `DATA`, advances
+  its watermark, and wakes connected clients — so app effects and the Rust
+  replica share one authoritative write path.
+- **`queries` resolves in-process.** Chat passes its ordinary `defineQueries`
+  registry into the host. The host invokes each desired query definition with
+  the authenticated claims as `ctx`, so argument validation and permission
+  scoping use the same code as the client without an app endpoint or service
+  binding round trip.
+- **`authenticate` delegates.** It reads the `Authorization: Bearer` session
+  token, resolves it against the app's `/api/auth/get-session` over the `APP`
+  binding, and caches the token-to-claims result briefly.
+- **`namespace` is environment-isolated and per-server.** The worker stamps
+  `staging` or `production`, producing host namespaces such as `staging:control`
+  and `production:p-<serverId>`; `upstreamPathForNamespace` maps `control` to
+  `/control` and `p-<serverId>` to `/proj-<serverId>` on `DATA`.
+- Chat needs both `APP` and `DATA` service bindings, and leaves
+  `retainChanges`, `idleTeardownMs`, `wakeCoalesceMs`, `delegatedPushRetry`, and
+  ingest-budget settings at host defaults.
+
+The composition worker (`rust-sync/chat-host/src/worker.ts`) exports
+`createSyncDurableObject(chatConfig)` as the DO class and wraps
+`createSyncWorker(chatConfig)` in an origin-restricted CORS layer that passes
+WebSocket upgrades through untouched. Staging and production use dedicated host
+workers and dedicated `APP`/`DATA` targets, and Chat imports the published
+`lime-sync-cf-host` package.
+
+Chat is live on this delegated design. The staging record (chat's
+`plans/cf-orez-migration-run.md`) verifies a fresh control snapshot, fresh
+project ingest, delegated message pushes, cold named-query pulls, hard-reload
+durability, cross-context live wake, and a server-action mutation replicated
+back into the Rust DO.
+
+## Contrast: delegated push with ingest
+
+Contrast's integration lives in `integrations/soot-rust-sync/`. Its config is a
+factory so the authenticator can differ between test and production
+(`src/config.ts`):
+
+```ts
+export function createSootSyncConfig(authenticate) {
+  return {
+    hostVersion: 'soot-rust-sync-0.2',
+    schema: sootZeroSchema,
+    mutateUrl: '/api/zero/push?schema=soot_0&appID=soot', // delegated push
+    mutateBinding: 'APP',
+    upstream: {
+      binding: 'DATA',
+      namespacePath: upstreamPathForNamespace, // ns -> /soot or /proj-<id>
+    },
+    initialize: initializeSootSchema,
+    authenticate,
+    namespace: namespaceForRequest,
+    queries: appQueries,
+    queryTransformVersion: 1,
+    retainChanges: 4_096,
+    wakeCoalesceMs: 25,
+  }
+}
+```
+
+The pieces:
+
+- **Push is delegated.** The client push is forwarded to
+  `/api/zero/push?schema=soot_0&appID=soot` over the `APP` binding, and the DO
+  then ingests the committed change stream from the `DATA` binding's feed at
+  `upstream.namespacePath`. Contrast has no local mutator registry at all. Its
+  projections and jobs keep writing through the app's real push endpoint, and
+  clients read what ingest replicates.
+- **Two service bindings.** `APP` is used by push and auth, while `DATA` serves
+  the change feed. Query resolution needs neither binding.
+- **`namespace` has planes.** `soot` and its legacy alias map to the
+  control-plane namespace; `proj-<id>` and `p-<id>` map to a project
+  namespace. Claims carry a `plane` discriminator plus project id and role.
+- Contrast sets `retainChanges` and `wakeCoalesceMs` explicitly
+  rather than taking defaults.
+
+Contrast is mid-cutover. The default deployable worker (`src/worker.ts`) still wires
+a test authenticator gated by `SOOT_SYNC_TEST_AUTH`, so the primary artifact is
+a harness. The production path exists (`src/production-worker.server.ts` plus
+`src/production-auth.server.ts`, which resolves identity and project membership
+over the app's `/api/zero/rust-auth`) but is referenced only by the deploy
+wrangler. The real production auth is written and quarantined behind the
+deploy-only entrypoint; the everyday worker ships test auth.
+
+## How they differ
+
+| Aspect           | Chat (live)                             | Contrast (mid-cutover)                  |
+| ---------------- | --------------------------------------- | --------------------------------------- |
+| Push             | Delegated `mutateUrl` + `mutateBinding` | Delegated `mutateUrl` + `mutateBinding` |
+| Upstream ingest  | `upstream` from the `DATA` feed         | `upstream` from the `DATA` feed         |
+| Service bindings | `APP` and `DATA`                        | `APP` and `DATA`                        |
+| Query resolution | `appQueries` registry in-process        | `appQueries` registry in-process        |
+| Auth             | app `/api/auth/get-session`             | app `/api/zero/rust-auth`               |
+| Namespace        | env + control/per-server planes         | control and project planes              |
+| Tuning           | host defaults                           | explicit retention, idle, wake          |
+
+Both apps now run the delegated write path. Chat initially used local mutators
+because upstream ingest did not yet exist — a delegated push then would have
+split write authority — and migrated once ingest landed (chat's `e882b97ba`);
+`1a2941e47` moved it onto the published host package. So the two now differ only
+in their auth endpoint and namespace planes, and both keep the identical
+query-permission definitions. Local mutators remain a supported mode for an app
+whose entire write surface can live in the host.
+
+## Integrate a new app
+
+Distilling both, a new app provides four things.
+
+### 1. A `SyncHostConfig`
+
+Required for every app: `hostVersion`, `schema` (derived from your Zero schema),
+`initialize(sql)` for your DDL, `authenticate(request, env)` returning
+`{userID, ...}`, and `namespace(request)` returning the DO partition key. Pass
+the app's ordinary `defineQueries` result as `queries`. Each query definition
+receives the authenticated claims as `ctx`, so it can scope rows to the current
+user.
+
+Then choose exactly one push model:
+
+- **Local**: `mutators` built with `registerMutators({...})`, keyed
+  by wire mutation name. No `upstream`. Right when your entire write surface can
+  live in the host.
+- **Delegated** (like Chat and Contrast): `mutateUrl` (an absolute path on the app),
+  `mutateBinding` (defaults to `upstream.binding`), and a required `upstream:
+{binding, namespacePath}`. Right when writes must run in the app worker, when
+  server-side effects (jobs, projections, notifications) run outside the sync
+  path, or when the app already owns a real push endpoint.
+
+All pulls use named queries. Set `queries: appQueries` and keep a
+`queryTransformVersion` epoch that you bump on permission or schema changes.
+
+#### How a mutator refuses a write
+
+Anything a mutator throws is a permanent application failure by default: the
+write rolls back, the client is told the mutation failed, and the ledger still
+advances so the client stops resending it. That is the right answer for a
+mutation that can never succeed, like a validation failure or a denied
+permission.
+
+Throw `MutationRetryError(retryAfterMs, message, details)` for the other case,
+where the mutation is fine and cannot run _yet_ (a budget, a rate limit, an open
+circuit). The whole push is refused with `429` and a `Retry-After` header,
+`details` rides the response body so the caller can pace on the reason, and
+nothing at all is written: no rows, no ledger advance, no change row. The
+mutation id is not consumed, so the client's next attempt applies it.
+
+Reaching for the default in that second case has a specific failure mode. An
+acknowledgement is itself a write, so a spend or rate guard that refuses by
+throwing an ordinary error charges for every refusal and drops the caller's
+data while doing it, which is the exact opposite of what it exists to do.
+
+### 2. A workerd composition entry
+
+A `worker.ts` that exports `createSyncDurableObject(config)` as the DO class and
+default-exports a fetch handler wrapping `createSyncWorker(config)` with a CORS
+layer (handle preflight, echo headers, pass 101 upgrades through).
+
+### 3. Wrangler config
+
+- A `SYNC_DO` Durable Object binding pointing at your DO class, with a
+  `[[migrations]]` `new_sqlite_classes` entry.
+- A `[[services]]` `APP` binding to the app worker when `authenticate` or
+  delegated `mutateUrl` calls it.
+- For delegated push, a second `[[services]]` `DATA` binding for the change
+  feed, matching `upstream.binding`.
+- Vars for the app origin and any admin or test flags. Import the published
+  `lime-sync-cf-host` (as Chat and Contrast do); aliasing the bare import to the orez
+  source is only for local orez development.
+
+### 4. App-worker endpoints
+
+The bound `APP` service must expose:
+
+- A session or identity endpoint for `authenticate` (`/api/auth/get-session` or
+  `/api/zero/rust-auth`).
+- For delegated push only: a push endpoint (`/api/zero/push`), plus a change
+  feed served at each namespace's `upstream.namespacePath` on the `DATA`
+  service.
+
+The app worker does not need a `/api/zero/pull` transform endpoint for Orez.
+Query definitions are bundled with the sync host through `config.queries`.
+
+### 5. Deploying updates: Durable Objects stay on old code until they restart
+
+A deployed Durable Object instance keeps running the code it was created with
+until the instance itself restarts. The host's ingest loop polls the data
+worker's change feed continuously, so a busy data-worker DO never goes idle and
+never picks up a new deploy on its own — you can `wrangler deploy` a data-tier
+fix and watch production keep exhibiting the old behavior indefinitely.
+
+To force a data-worker DO onto new code: stop whatever is polling it (for a
+disposable host worker, `wrangler delete` it), wait for the DO to go idle and
+evict (about a minute), then redeploy the host. This came from a real incident
+during the Contrast cutover: a catalog-cache fix was deployed but the resident
+`ZeroSqlDO` stayed on the old class because the host never stopped polling
+`/changes`.
+
+Fresh DO instances always boot the newest deploy, so a fix that only matters
+for new namespaces (for example a provisioning-race fix) is effective the
+moment the worker deploys, without evicting resident objects.
+
+### 6. Deploy-time traps that have bitten in production
+
+- **Environment selection.** A deploy script run through a dev-oriented env
+  loader (`bun src/env.ts -- ...` styles that default to `.env.development`)
+  will silently deploy dev-valued secrets to production workers. The Contrast data
+  worker twice received a dev `BETTER_AUTH_SECRET` (which also feeds
+  `OREZ_DO_WRITE_BUDGET_ADMIN_TOKEN`) this way; the app kept serving because
+  the app worker held the prod value, so smoke checks passed while admin
+  routes 403'd. After any data-worker deploy, verify secret provenance or
+  re-put the prod values explicitly.
+- **Secret uploads create new worker versions.** `wrangler secret put` after
+  `wrangler deploy` produces a second version id; when reconciling "which
+  build is live" from tails, expect the post-secret version, not the one the
+  deploy printed.
+- **`wrangler tail` can go silently blind** on a long-idle worker: the
+  WebSocket drops while the process stays alive, so a supervisor that only
+  watches process liveness never reconnects. Monitors need a per-tail
+  freshness heartbeat (page when the newest event is older than the worker's
+  known activity from another signal, such as a budget counter moving).

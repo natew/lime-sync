@@ -1,0 +1,273 @@
+# Architecture
+
+The orez rust sync server is a Zero server that runs on SQLite. It speaks the
+Zero protocol to the real `@rocicorp/zero` client and replaces zero-cache for
+deployments where you would rather not run Postgres and a long-lived cache
+process. On Cloudflare it runs as one Durable Object per namespace, holding both
+the sync engine and its SQLite storage inside the same object.
+
+The client half of Zero is unchanged. The ZQL query engine, the local store,
+and optimistic mutations stay exactly as Rocicorp ships them. What orez replaces
+is the server half: replicating upstream data, feeding row changes to clients,
+running custom mutators, tracking per-client last-mutation-ids, and serving
+per-query incremental sync.
+
+## The pieces
+
+The deterministic engine and its WASM wrapper feed three hosts: native,
+Cloudflare, and a browser worker. The TypeScript executor owns application
+transactions, CRUD, mutation replay, and the local HTTP mount surface.
+
+### crates/sync-core
+
+The deterministic sync engine, written in Rust. Its wire behavior is kept in
+lockstep with the executor-backed TypeScript host by differential tests (see the
+testing page). It has no async, no network, and no filesystem access, which is
+what lets it compile to WASM and run inside a Durable Object.
+
+The engine owns a small set of internal SQLite tables and the protocol logic
+over them. Its modules (`crates/sync-core/src/`):
+
+- `pull.rs`: shared change-log lifecycle helpers (`watermark`, `floor`, `prune`,
+  `invalidate`).
+- `push.rs`: v51 custom-mutator pushes as a set of step functions the host
+  drives around its own (possibly async) mutator: `push_validate`, `preflight`,
+  `finalize`, `record_app_error`, `assemble_push_response`. A synchronous
+  `handle_push` composes those steps for the native host and tests.
+- `query/`: the single pull path: `ast.rs`, `compile.rs` (Zero AST to SQL),
+  `membership.rs`, and `qpull.rs` (`handle_query_pull`).
+- `upstream.rs`: `apply_upstream` and `apply_upstream_snapshot`, which ingest
+  rows from an upstream change feed and advance the engine's change log exactly
+  as a push does.
+- `schema.rs`: table specs and the change-tracking trigger DDL.
+- `value.rs`, `wire.rs`, `db.rs`, `store.rs`, `error.rs`: value coercion to
+  Zero column types, the counter wire format, the tiny SQLite trait the host
+  implements, and errors.
+
+Three boundary rules are pinned in `crates/sync-core/src/lib.rs` and must not be
+relaxed:
+
+1. The host owns transaction entry and exit. The engine never emits
+   `BEGIN`/`COMMIT`/`SAVEPOINT` because Durable Object SQL rejects them. Every
+   entry point documents the transaction the host must have open around it.
+2. Positional `?` bindings only. DO `SqlStorage` has no `?N` numbered bindings.
+3. Patch values come from live rows read inside the pull transaction, never
+   from logged row images. SQLite's `json_object` rounds `REAL` to 15
+   significant figures, so a float column round-tripped through the change log
+   would corrupt. The log stores touched primary keys only; the diff re-reads
+   the live row.
+
+Counters (watermarks, cookies, last-mutation-ids) are `i64` end to end, read
+with `CAST(x AS TEXT)` so a value never passes through a float.
+
+### crates/sync-wasm
+
+The `wasm-bindgen` wrapper around sync-core (`crates/sync-wasm/src/lib.rs`). It
+exposes the engine as a flat set of `engine_*` functions the host calls across
+the WASM boundary: `engine_init_schema`, `engine_handle_query_pull`,
+`engine_push_validate`, `engine_preflight`,
+`engine_finalize`, `engine_assemble_push_response`, `engine_apply_upstream`,
+`engine_apply_upstream_snapshot`, `engine_prune`, `engine_invalidate`,
+`engine_compile_query`, `engine_state`, `engine_version`, `engine_memory_bytes`,
+and a few more. It also declares `JsSyncDb`, the SQLite handle the host passes
+in, so every SQL call goes back out to the host's storage.
+
+`wasm-pack build crates/sync-wasm --target web` produces the JavaScript glue and
+`.wasm`. The Cloudflare and browser host builds each package that output with
+their host code.
+
+### crates/sync-native
+
+A standalone axum HTTP host for the same engine
+(`crates/sync-native/src/main.rs` and friends: `engine.rs`, `namespace.rs`,
+`wake.rs`, `seed.rs`, `fault.rs`, `obs.rs`). It serves the same pull/push
+surface over native Rust with `rusqlite` storage instead of a Durable Object.
+By default every process generates a 256-bit admin token. `/<namespace>/admin/*` and
+`/admin/health` require it in `x-admin-key`, and browser-origin admin requests
+are rejected even when the token is correct. Browser pull, push, and wake
+traffic must match an origin explicitly allowed by the embedding process;
+originless native/server clients remain supported.
+It exists to keep one engine story across deployments. It is not on the
+Cloudflare cutover path, so it trails the CF host on the newer modes (upstream
+ingest parity is described as a follow-up in
+`plans/rust-sync-upstream-ingest.md`).
+
+### packages/lime-sync-cf-host
+
+The Cloudflare Durable Object host, published to npm as `lime-sync-cf-host`.
+This is the layer real apps consume. It is TypeScript plus the vendored WASM
+engine, and it exports two factories from `src/index.ts`:
+
+- `createSyncWorker(config)`: the consumer-facing Worker router. It runs
+  authentication at the edge, resolves the namespace, and forwards the request
+  to the right Durable Object with normalized claims on a binding-private
+  header.
+- `createSyncDurableObject(config)`: the namespace Durable Object class. One
+  instance per namespace (`env.SYNC_DO.idFromName(namespace)`), holding the
+  engine and its SQLite storage. It handles `/pull`, `/push`, the `/wake`
+  advisory socket, `/notify`, and an `/admin/*` surface.
+
+Everything an app varies (schema, auth, namespace resolution, query registry,
+mutators or push delegation, upstream ingest) is passed in as one
+`SyncHostConfig` object. That object is the entire public API; the configuration
+page documents every field.
+
+`lime-sync` exposes the shared application-database boundary. Both hosts call
+it for registered mutators, CRUD SQL, last-mutation-id ownership, replay, and
+deferred effects. Node and bun applications launch the Rust host through
+`lime-sync/native`. The CF host keeps the Rust pull and ingest engine compiled
+to WASM.
+
+### packages/lime-sync-browser-host
+
+The browser host is exported as `lime-sync/browser`. It loads sync-wasm
+and Bedrock SQLite in one worker and serves the same authenticated `/pull` and
+`/push` protocol through a `MessagePort`. The same port also exposes serialized
+direct `query` and `exec` calls for preview tooling. All attached clients receive
+an advisory `data-changed` event after a durable mutation or direct write.
+
+One operation queue owns the database. A mutation runs its generated application
+code and Rust last-mutation-id finalization inside one explicit SQLite
+transaction. The host hashes Bedrock's in-memory VFS in fixed-size chunks, then
+writes only changed chunks plus one manifest in a single IndexedDB transaction
+owned by that host's `storageKey`. It waits for that transaction before replying.
+Separate hosts therefore never share an IndexedDB transaction queue, and a small
+SQLite write does not rewrite the full database. Browser snapshots are
+rebuildable cache state, so a host deletes obsolete shared, marker, and v1
+snapshot databases instead of converting them. If an IndexedDB commit fails,
+the live database is closed and the host rejects all later work. A new worker
+restores the manifest and chunks before opening SQLite. There is no in-memory
+fallback.
+
+The host accepts the application's mutator registry and named-query resolver so
+generated validators, permissions, transaction helpers, and deferred effects
+keep working without a second mutation-bookkeeping path. The `lime-sync` package
+includes both WASM binaries beside the subpath export, so ordinary worker
+bundles do not need consumer-specific asset copies.
+
+## The two request paths
+
+At runtime a client does exactly two things against the host: pull and push.
+
+**Pull** (`POST /<namespace>/pull`). The worker authenticates the request,
+attaches normalized claims, and forwards to the DO. The host resolves every
+desired named query against the app's `config.queries` registry, passing those
+claims as the query context. The DO opens one synchronous SQLite transaction and
+calls `engine_handle_query_pull`. The engine applies the desired-query patch,
+updates durable group membership, and compares the client's cookie to the
+change log's high watermark:
+
+- cookie equals the watermark with no desired-query change: `{cookie,
+unchanged: true}`.
+- a fresh client, a cookie below the retained floor, or an epoch reset: clear
+  the client store and put the rows selected by the group's current queries.
+- a cookie within the retained window: membership-driven puts and dels for
+  changed rows and desired-query changes.
+- a cookie ahead of the watermark: HTTP 409, and the client rebuilds its local
+  store from scratch.
+
+Per-user scoping lives in the resolved query ASTs. A group never receives a del
+for a row it did not hold, and the engine never projects the full namespace to
+serve a pull.
+
+**Push** (`POST /<namespace>/push`). A v51 custom-mutator body. In local-mutator
+mode the DO runs the app's mutator inside the push transaction, advances the
+last-mutation-id, and appends a change-log marker so peers' pulls stop reporting
+`unchanged`. In delegation mode the DO forwards the push to the app's real
+endpoint and lets upstream ingest deliver the rows. Both modes are covered on
+the delegation page.
+
+## The change log
+
+The cookie is the high watermark of the per-namespace packed ledger
+(`_zsync_log_segments`; the data worker has its separate `_zero_changes` CDC
+queue). SQLite triggers installed per table append touched primary keys to the
+active segment on every write path, whether the write came from a mutator, from
+admin SQL, or from upstream ingest. The ledger stores keys and cookies, never
+row values or last-mutation-ids (those live only in the clients table below).
+Retention prunes completed
+segments and raises the floor. A client whose cookie has fallen below the floor
+gets a snapshot on its next pull.
+
+The payload is versioned. Format 2 (orez 0.15) keeps last-mutation-ids out of
+the payload entirely; the schema pass migrates a format-1 namespace in place on
+first boot and cannot be rolled back. See
+[Trade-offs](./trade-offs.md#ledger-format-2-is-a-one-way-migration).
+
+This is the whole recovery model. Fresh clients, below-floor cookies, and epoch
+invalidation clear the client store and rehydrate the group's current query
+membership. Desired queries and row membership are durable engine state, along
+with the clients table (`_zsync_clients`) that stores last-mutation-ids and the
+client-group to user binding. The wake socket remains advisory and carries no
+row data.
+
+## Wake targeting
+
+After an ingest applies a batch, the Cloudflare host wakes only the clients whose
+group can see a changed row (`crates/sync-core/src/query/wake.rs`). Waking every
+socket on every commit made arrivals cost the object one pull per connected
+client per commit, nearly all of them empty. Each registered query stores a
+plan: anchor keys for nodes whose predicate pins `column = literal`, and
+shape-level recipes that follow correlations for nodes that do not. A change
+wakes the groups that hold the row, the groups whose anchors its values match,
+and the groups its recipes reach through correlated rows, so the work per ingest
+grows with changed rows rather than with connected groups. A node nothing can
+bound, and everything below a NOT EXISTS, registers its group under `all` for
+its table. The answer must be a superset of the groups whose next pull changes;
+`crates/sync-core/tests/wake_targets.rs` checks that against real pulls. A
+completed snapshot, a reset, or a batch over 512 rows still wakes everyone.
+
+## Paged upstream resnapshot
+
+The Cloudflare host rebuilds a derived replica through bounded, keyset-ordered
+source pages. Each page commits to a staged generation with its table and opaque
+source cursor recorded durably. A Durable Object eviction or process restart
+therefore resumes the generation instead of restarting a large transaction.
+
+Source pages are intentionally fuzzy across requests. After every table is
+staged, the host replays the retained change feed from the first page's
+watermark until caught up. Finalization atomically swaps the staged tables into
+place and bumps the sync-core epoch in the same transaction. Every client then
+performs one full resync because its old cookie belongs to the previous table
+generation. That reset is expected.
+
+The source still supports the legacy single-response `/snapshot` endpoint for
+small datasets and older harnesses, but Lime Sync uses the paged, resumable path
+by default. Replica DDL used by this flow must not contain foreign keys; the
+authoritative source owns referential integrity, and cross-page replica
+enforcement cannot be correct.
+
+## How it fits the rest of orez
+
+The broader orez project is a local Zero development stack (run Zero on PGlite or
+embedded Postgres with no native dependencies, see the repo README). The rust
+sync server is the piece that carries that same SQLite-native approach to
+production on Cloudflare.
+
+On Cloudflare the deployment has two Durable Object roles:
+
+- The **data worker** (`packages/lime-sync/src/cf-do/worker.ts`, the `ZeroSqlDO` class) is the
+  write side. Apps use the typed Application SQL Durable Object RPC, and it
+  stores rows in DO SQLite. It exposes a
+  watermark-cursored change feed the sync host consumes:
+  `GET/POST /<db>/changes {watermark, limit}` returns `{watermark, changes}` and
+  answers HTTP 410 `watermarkTooOld` when the cursor precedes the retained
+  floor; `GET /<db>/snapshot` returns every tracked table; `POST /<db>/notify`
+  wakes ingest. Authoritative row capture is in `packages/lime-sync/src/cf-do/cdc.ts`: generated
+  SQLite triggers stage full before/after images in the same statement as the
+  row write, including indirect writes from business triggers. Explicit
+  transactions are grouped and promoted only at commit; `packages/lime-sync/src/cf-do/row-undo.ts`
+  uses the same images for rollback and crash recovery. This is logical CDC,
+  not WAL/page copying. `packages/lime-sync/src/do-sql-tracking.ts` meters billable writes, while
+  `src/change-tracking.ts` is the separate Postgres-compatible replication
+  entrypoint.
+- The **sync host** (`packages/lime-sync-cf-host`) is the read side. It ingests the
+  data worker's feed into the engine's own change log, then serves pulls and
+  pushes. Application writes and sync ingestion share the same authoritative
+  SQLite object without a Postgres compatibility layer.
+
+The canonical Orez transport integration lives at `lime-sync/client`, with
+source in `packages/lime-sync/src/client/`. It keeps `@rocicorp/zero` as the
+client and maps its sync connection onto the Lime Sync pull, push, and wake
+server endpoints. Downstream vendored copies are refreshed from this
+implementation.

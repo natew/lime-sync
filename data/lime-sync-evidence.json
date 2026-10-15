@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "status": "unverified",
+  "release": {
+    "version": "0.5.18",
+    "tag": "v0.5.18",
+    "sha": "f76e80f080ff0ee78f5c09b479286146b5cd6dcf",
+    "url": "https://github.com/natew/orez/tree/v0.5.18"
+  },
+  "build": {
+    "sha": null,
+    "url": null
+  },
+  "versions": {
+    "zero": "1.7.0",
+    "rust": "1.94.0",
+    "sqlite": "3.46.0",
+    "rusqlite": "0.32.1",
+    "libsqlite3Sys": "0.30.1",
+    "workerd": "1.20260617.1",
+    "wrangler": "4.103.0",
+    "bun": null
+  },
+  "qualification": {
+    "qualifiedAt": null,
+    "lastGreen": null,
+    "scenarioCount": null,
+    "randomizedSeed": null,
+    "operationCount": null,
+    "operationUnit": null,
+    "restarts": null,
+    "durationMs": null
+  },
+  "supportedContracts": [],
+  "compatibility": [
+    {
+      "host": "Native",
+      "status": "awaiting",
+      "contract": "sync-native HTTP, SQLite transactions, wake, permissions, query lifecycle"
+    },
+    {
+      "host": "WASM / workerd",
+      "status": "awaiting",
+      "contract": "sync-wasm representation and the local Durable Object host boundary"
+    },
+    {
+      "host": "Stock-Zero differential",
+      "status": "awaiting",
+      "contract": "Named-query results and randomized incremental behavior against Zero 1.7.0"
+    }
+  ],
+  "suites": [
+    {
+      "id": "rust-core",
+      "name": "Deterministic Rust core",
+      "host": "Core / native SQLite",
+      "status": "awaiting",
+      "scenarioCount": null,
+      "randomizedSeed": null,
+      "operationCount": null,
+      "operationUnit": "not applicable",
+      "restarts": 0,
+      "durationMs": null,
+      "whatItProves": "This suite covers cookies, patches, mutation IDs, retention, query membership, permissions, and model invariants at the recorded SHA.",
+      "whatItDoesNotProve": "It does not prove HTTP host lifecycle, workerd behavior, production capacity, or application-specific schemas and policies.",
+      "commands": ["cargo test --workspace"],
+      "logsUrl": null,
+      "artifactsUrl": null
+    },
+    {
+      "id": "native-host",
+      "name": "Native host qualification",
+      "host": "sync-native",
+      "status": "awaiting",
+      "scenarioCount": null,
+      "randomizedSeed": null,
+      "operationCount": null,
+      "operationUnit": "distinct native-host conformance lanes; per-lane totals (sweep rounds, storm clients, query shapes) are not summed into an operation count",
+      "restarts": null,
+      "durationMs": null,
+      "whatItProves": "This suite exercises the release native binary through real Zero clients, concurrent clients, permissions, wake, and query lifecycle; validates recorded atomic-visibility and exactly-once histories with checkers that are themselves red-proofed; runs the pinned Elle list-append analysis on the recorded history; and cuts a mutation's row effects from its ack under a one-row diff cap.",
+      "whatItDoesNotProve": "It does not prove the Cloudflare host, multi-region behavior, unbounded namespace sizes, or a consumer's recovery objectives.",
+      "commands": [
+        "cd harness && bun src/shapes.ts --against rust-local",
+        "cd harness && bun src/sweep.ts --against rust-local --rounds 10 --seed <ledger-seed>",
+        "cd harness && bun src/queries.ts --against rust-local",
+        "cd harness && bun src/atomic-visibility-lane.ts --target rust-local --seed <ledger-seed>",
+        "scripts/elle/check-history.sh",
+        "cd harness && bun src/capped-diff-lane.ts --target rust-local"
+      ],
+      "logsUrl": null,
+      "artifactsUrl": null
+    },
+    {
+      "id": "wasm-workerd",
+      "name": "WASM / workerd qualification",
+      "host": "sync-wasm + local workerd",
+      "status": "awaiting",
+      "scenarioCount": null,
+      "randomizedSeed": null,
+      "operationCount": null,
+      "operationUnit": "distinct sync-cf-host lanes; the operation count is recorded state-machine lifecycle steps, not push-soak or protocol-fuzz totals",
+      "restarts": null,
+      "durationMs": null,
+      "whatItProves": "This suite covers WASM value boundaries, local Durable Object SQLite transactions, ingest, restart, push-memory soak, protocol fuzz, recovery faults, backup/restore, and generated lifecycle transitions under the pinned workerd.",
+      "whatItDoesNotProve": "Local workerd is not the Cloudflare production service and does not establish isolate memory, regional propagation, quota, or eviction behavior in a deployed account.",
+      "commands": [
+        "cd packages/sync-cf-host && bun run test",
+        "cd harness && bun src/push-memory-soak.ts --target rust-cf --blocks 3 --ops 3000 --writers 12",
+        "cd harness && bun src/protocol-fuzz.ts --target rust-cf --cases 500 --seed <ledger-seed> --concurrency 20",
+        "cd harness && bun src/state-machine.ts --against rust-cf --seed <ledger-seed> --steps 24"
+      ],
+      "logsUrl": null,
+      "artifactsUrl": null
+    },
+    {
+      "id": "native-fault-recovery",
+      "name": "Native fault and lifecycle qualification",
+      "host": "sync-native + stock-Zero oracle",
+      "status": "awaiting",
+      "scenarioCount": null,
+      "randomizedSeed": null,
+      "operationCount": null,
+      "operationUnit": "distinct fault and lifecycle lanes; the operation count is recorded state-machine lifecycle steps, not protocol-fuzz cases",
+      "restarts": null,
+      "durationMs": null,
+      "whatItProves": "This suite covers pinned upstream corpus agreement, malformed protocol input, reconnect/retention (including a client offline past the retention floor), process eviction, transactional storage faults, backup/restore, and the composed nemesis state machine on the native host: receipted engine faults at named boundaries, a transport outage held open across a fault arm and a restart, and a full prune plus restart that must keep the served cookie monotonic.",
+      "whatItDoesNotProve": "Injected faults cover named boundaries and generated traces, not every operating-system, filesystem, hardware, or application failure mode.",
+      "commands": [
+        "cd harness && bun src/corpus-check.ts",
+        "cd harness && bun src/upstream-corpus.ts --hosts stock-zero,sync-native",
+        "cd harness && bun src/protocol-fuzz.ts --target rust-local --cases 500 --seed <ledger-seed> --concurrency 20",
+        "cd harness && bun src/state-machine.ts --against rust-local --nemesis --seed <ledger-seed> --steps 24"
+      ],
+      "logsUrl": null,
+      "artifactsUrl": null
+    },
+    {
+      "id": "stock-zero-differential",
+      "name": "Stock-Zero differential",
+      "host": "Zero 1.7.0 oracle",
+      "status": "awaiting",
+      "scenarioCount": null,
+      "randomizedSeed": null,
+      "operationCount": null,
+      "operationUnit": "distinct stock-Zero differential harness lanes; per-query comparisons are not summed into an operation total",
+      "restarts": 0,
+      "durationMs": null,
+      "whatItProves": "Named and seeded query scenarios produce the same observable results as the pinned stock Zero server for the exercised corpus.",
+      "whatItDoesNotProve": "Differential agreement is limited to the recorded corpus and Zero version; it is not a claim of internal implementation equivalence or future-version compatibility.",
+      "commands": [
+        "cd harness && bun src/shapes.ts --against rust-local",
+        "cd harness && bun src/query-diff.ts",
+        "cd harness && bun src/sweep.ts --against rust-local --rounds 10 --seed <ledger-seed>"
+      ],
+      "logsUrl": null,
+      "artifactsUrl": null
+    }
+  ],
+  "artifacts": {
+    "evidenceJsonUrl": null,
+    "logsUrl": null,
+    "regressionTracesUrl": null,
+    "regressionTraceCount": 0,
+    "retentionDays": 90
+  },
+  "reproduction": {
+    "environment": [
+      "mise use node@24.3.0",
+      "bun install --frozen-lockfile",
+      "cd harness && bun install --frozen-lockfile"
+    ],
+    "full": [
+      "cargo test --workspace",
+      "cd harness && bun src/shapes.ts --against rust-local",
+      "cd harness && bun src/sweep.ts --against rust-local --rounds 10 --seed <ledger-seed>",
+      "cd harness && bun src/state-machine.ts --against rust-local --nemesis --seed <ledger-seed> --steps 24",
+      "cd packages/sync-cf-host && bun run test"
+    ]
+  },
+  "knownLimitations": [
+    "The checked-in fallback contains no exact-SHA CI result. A qualified main or tag build replaces it during the site build.",
+    "The workerd lane is local emulation; deployed Cloudflare isolate memory, quota, eviction, and regional propagation require a separate named deployment qualification.",
+    "The compatibility corpus is pinned to Zero 1.7.0 and does not imply compatibility with later Zero releases.",
+    "GitHub Actions logs and artifacts are immutable per run but remain subject to the repository's retention policy."
+  ],
+  "unresolvedLanes": [
+    {
+      "name": "Exact-SHA CI evidence",
+      "status": "awaiting",
+      "detail": "The repository fallback intentionally contains no generated workflow result.",
+      "url": "https://github.com/natew/orez/actions"
+    },
+    {
+      "name": "Deployed Cloudflare qualification",
+      "status": "fragile",
+      "detail": "The deployed rust-cf query differential and platform-specific soak remain outside the standard CI gate.",
+      "url": "https://github.com/natew/orez/blob/261530c1778874e3fbae28d1704316e2aff1b364/plans/rust-sync-m6-qualification.md"
+    }
+  ],
+  "gate": {
+    "workflow": "CI",
+    "branch": "main",
+    "requiredJobs": [
+      "test",
+      "harness",
+      "native-integration",
+      "rust",
+      "rust-local",
+      "rust-local-faults",
+      "sync-cf-host",
+      "sync-browser-host"
+    ],
+    "policy": "CI publishes verified build evidence only after every required job succeeds at the exact build SHA. It labels that build a verified release only when the immutable release tag resolves to the same SHA."
+  }
+}

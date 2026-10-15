@@ -1,0 +1,943 @@
+//! Narrow wasm-bindgen boundary between `sync-core` and Durable Object SQL.
+//!
+//! The JavaScript object passed to these exports implements the same synchronous
+//! `exec`/`query` shape as [`sync_core::SyncDb`]. Transactions deliberately stay
+//! in JavaScript: neither this crate nor `sync-core` emits transaction SQL.
+
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use sync_core::{DbError, Row, SqlValue, SyncDb, WireValue};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+    pub type JsSyncDb;
+
+    #[wasm_bindgen(method, catch, js_name = exec)]
+    fn js_exec(this: &JsSyncDb, sql: &str, params: JsValue) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, catch, js_name = query)]
+    fn js_query(this: &JsSyncDb, sql: &str, params: JsValue) -> Result<JsValue, JsValue>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireRow {
+    columns: Vec<String>,
+    values: Vec<WireValue>,
+}
+
+struct WasmDb<'a>(&'a JsSyncDb);
+
+impl WasmDb<'_> {
+    fn js_error(error: impl std::fmt::Debug) -> DbError {
+        DbError(format!("JavaScript adapter error: {error:?}"))
+    }
+}
+
+impl SyncDb for WasmDb<'_> {
+    fn exec(&mut self, sql: &str, params: &[SqlValue]) -> Result<(), DbError> {
+        let params: Vec<_> = params.iter().map(WireValue::from).collect();
+        let params = serde_wasm_bindgen::to_value(&params).map_err(Self::js_error)?;
+        self.0.js_exec(sql, params).map_err(Self::js_error)
+    }
+
+    fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>, DbError> {
+        let params: Vec<_> = params.iter().map(WireValue::from).collect();
+        let params = serde_wasm_bindgen::to_value(&params).map_err(Self::js_error)?;
+        let rows = self.0.js_query(sql, params).map_err(Self::js_error)?;
+        let rows: Vec<WireRow> = serde_wasm_bindgen::from_value(rows).map_err(Self::js_error)?;
+
+        rows.into_iter()
+            .map(|row| {
+                if row.columns.len() != row.values.len() {
+                    return Err(DbError(format!(
+                        "adapter row has {} columns but {} values",
+                        row.columns.len(),
+                        row.values.len()
+                    )));
+                }
+                Ok(Row {
+                    columns: Arc::from(row.columns),
+                    values: row
+                        .values
+                        .into_iter()
+                        .map(SqlValue::try_from)
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn js_err(error: impl std::fmt::Display) -> JsValue {
+    js_sys::Error::new(&error.to_string()).into()
+}
+
+#[cfg(feature = "platform-probes")]
+fn one_text(row: &Row, name: &str) -> Result<String, JsValue> {
+    match row.get(name) {
+        Some(SqlValue::Text(value)) => Ok(value.clone()),
+        value => Err(js_err(format!(
+            "expected text column {name}, got {value:?}"
+        ))),
+    }
+}
+
+/// Initialize only probe tables. The host wraps this in `transactionSync`.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn init_probe_schema(db: &JsSyncDb) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS probe_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), lmid INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, balance REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, amount REAL NOT NULL, note TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, payload TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS mutation_log (mutation_id TEXT PRIMARY KEY, lmid INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS value_probe (id INTEGER PRIMARY KEY, integer_value INTEGER NOT NULL, real_value REAL NOT NULL, text_value TEXT NOT NULL, blob_value BLOB NOT NULL, null_value TEXT, json_value TEXT NOT NULL, boolean_value INTEGER NOT NULL, boundary_value INTEGER NOT NULL)",
+    ] {
+        db.exec(sql, &[]).map_err(js_err)?;
+    }
+    db.exec(
+        "INSERT OR IGNORE INTO probe_state (singleton, lmid) VALUES (1, 0)",
+        &[],
+    )
+    .map_err(js_err)?;
+    db.exec(
+        "INSERT OR IGNORE INTO accounts (id, balance) VALUES (?, ?)",
+        &[SqlValue::Text("primary".into()), SqlValue::Real(100.0)],
+    )
+    .map_err(js_err)
+}
+
+#[cfg(feature = "platform-probes")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullSnapshot {
+    lmid: String,
+    balance: f64,
+}
+
+/// Representative synchronous pull read performed wholly inside the host tx.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn pull_snapshot(db: &JsSyncDb) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let rows = db
+        .query(
+            "SELECT CAST(s.lmid AS TEXT) AS lmid, a.balance AS balance FROM probe_state s JOIN accounts a ON a.id = ? WHERE s.singleton = 1",
+            &[SqlValue::Text("primary".into())],
+        )
+        .map_err(js_err)?;
+    let row = rows.first().ok_or_else(|| js_err("missing probe state"))?;
+    let lmid = one_text(row, "lmid")?;
+    let balance = match row.get("balance") {
+        Some(SqlValue::Real(value)) => *value,
+        Some(SqlValue::Integer(value)) => *value as f64,
+        value => return Err(js_err(format!("expected numeric balance, got {value:?}"))),
+    };
+    serde_wasm_bindgen::to_value(&PullSnapshot { lmid, balance }).map_err(js_err)
+}
+
+/// Ordering/replay preflight. LMIDs cross JS as decimal strings, never numbers.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn push_preflight(db: &JsSyncDb, mutation_id: &str) -> Result<String, JsValue> {
+    let mut db = WasmDb(db);
+    if !db
+        .query(
+            "SELECT mutation_id FROM mutation_log WHERE mutation_id = ?",
+            &[SqlValue::Text(mutation_id.into())],
+        )
+        .map_err(js_err)?
+        .is_empty()
+    {
+        return Err(js_err(format!("mutation {mutation_id:?} already applied")));
+    }
+    let row = db
+        .query(
+            "SELECT CAST(lmid AS TEXT) AS lmid FROM probe_state WHERE singleton = 1",
+            &[],
+        )
+        .map_err(js_err)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| js_err("missing probe state"))?;
+    one_text(&row, "lmid")
+}
+
+/// Finalize ordering only after the JavaScript mutator has succeeded.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn push_finalize(
+    db: &JsSyncDb,
+    mutation_id: &str,
+    expected_lmid: &str,
+) -> Result<String, JsValue> {
+    let mut db = WasmDb(db);
+    db.exec(
+        "UPDATE probe_state SET lmid = lmid + 1 WHERE singleton = 1 AND CAST(lmid AS TEXT) = ?",
+        &[SqlValue::Text(expected_lmid.into())],
+    )
+    .map_err(js_err)?;
+    let row = db
+        .query(
+            "SELECT CAST(lmid AS TEXT) AS lmid FROM probe_state WHERE singleton = 1",
+            &[],
+        )
+        .map_err(js_err)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| js_err("missing probe state"))?;
+    let lmid = one_text(&row, "lmid")?;
+    let expected_next = expected_lmid
+        .parse::<i64>()
+        .map_err(js_err)?
+        .checked_add(1)
+        .ok_or_else(|| js_err("LMID overflow"))?
+        .to_string();
+    if lmid != expected_next {
+        return Err(js_err(format!(
+            "LMID compare-and-swap failed: expected {expected_next}, got {lmid}"
+        )));
+    }
+    db.exec(
+        "INSERT INTO mutation_log (mutation_id, lmid) VALUES (?, ?)",
+        &[
+            SqlValue::Text(mutation_id.into()),
+            SqlValue::Integer(lmid.parse().map_err(js_err)?),
+        ],
+    )
+    .map_err(js_err)?;
+    Ok(lmid)
+}
+
+/// Mutate both application data and the counter, then trap. The host must roll
+/// back both writes when the panic crosses the wasm/JavaScript boundary.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn rust_panic_after_writes(db: &JsSyncDb) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    db.exec(
+        "INSERT INTO ledger (account_id, amount, note) VALUES (?, ?, ?)",
+        &[
+            SqlValue::Text("primary".into()),
+            SqlValue::Real(999.0),
+            SqlValue::Text("must roll back after Rust panic".into()),
+        ],
+    )
+    .map_err(js_err)?;
+    db.exec(
+        "UPDATE probe_state SET lmid = lmid + 1 WHERE singleton = 1",
+        &[],
+    )
+    .map_err(js_err)?;
+    panic!("intentional M0 Rust panic after SQL writes")
+}
+
+#[cfg(feature = "platform-probes")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValueRoundTrip {
+    integer: String,
+    real: f64,
+    text: String,
+    blob: Vec<u8>,
+    null: Option<String>,
+    json: serde_json::Value,
+    boolean: bool,
+    boundary: String,
+}
+
+/// JS -> wasm -> SQLite -> wasm -> JS fidelity probe. Integer fields are
+/// decimal strings on the JS/wire side; SQL uses INTEGER and exact CAST reads.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn value_round_trip(db: &JsSyncDb, input: JsValue) -> Result<JsValue, JsValue> {
+    let input: ValueRoundTrip = serde_wasm_bindgen::from_value(input).map_err(js_err)?;
+    let integer = input.integer.parse::<i64>().map_err(js_err)?;
+    let boundary = input.boundary.parse::<i64>().map_err(js_err)?;
+    let json = serde_json::to_string(&input.json).map_err(js_err)?;
+    let mut db = WasmDb(db);
+    db.exec("DELETE FROM value_probe", &[]).map_err(js_err)?;
+    db.exec(
+        "INSERT INTO value_probe (id, integer_value, real_value, text_value, blob_value, null_value, json_value, boolean_value, boundary_value) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            SqlValue::Integer(integer),
+            SqlValue::Real(input.real),
+            SqlValue::Text(input.text),
+            SqlValue::Blob(input.blob),
+            SqlValue::Null,
+            SqlValue::Text(json),
+            SqlValue::Integer(i64::from(input.boolean)),
+            // Binding as decimal text lets SQLite's INTEGER affinity parse the
+            // exact i64 without first passing through a JavaScript Number.
+            SqlValue::Text(boundary.to_string()),
+        ],
+    )
+    .map_err(js_err)?;
+    let row = db
+        .query(
+            "SELECT CAST(integer_value AS TEXT) AS integer_value, real_value, text_value, blob_value, null_value, json_value, CAST(boolean_value AS TEXT) AS boolean_value, CAST(boundary_value AS TEXT) AS boundary_value FROM value_probe WHERE id = 1",
+            &[],
+        )
+        .map_err(js_err)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| js_err("value probe row missing"))?;
+    let real = match row.get("real_value") {
+        Some(SqlValue::Real(value)) => *value,
+        value => return Err(js_err(format!("expected real value, got {value:?}"))),
+    };
+    let blob = match row.get("blob_value") {
+        Some(SqlValue::Blob(value)) => value.clone(),
+        value => return Err(js_err(format!("expected blob value, got {value:?}"))),
+    };
+    let null = match row.get("null_value") {
+        Some(SqlValue::Null) => None,
+        value => return Err(js_err(format!("expected null value, got {value:?}"))),
+    };
+    let output = ValueRoundTrip {
+        integer: one_text(&row, "integer_value")?,
+        real,
+        text: one_text(&row, "text_value")?,
+        blob,
+        null,
+        json: serde_json::from_str(&one_text(&row, "json_value")?).map_err(js_err)?,
+        boolean: one_text(&row, "boolean_value")? == "1",
+        boundary: one_text(&row, "boundary_value")?,
+    };
+    output
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_err)
+}
+
+#[cfg(feature = "platform-probes")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalPkProbe {
+    primary_key: Vec<String>,
+    pk: serde_json::Value,
+}
+
+/// Canonical primary-key encoding probe, run against the SAME
+/// harness/fixtures/canonical-pk-vectors.json the native build asserts in
+/// sync_core::value's tests.
+///
+/// This is the half of the conformance that matters: sync-native compiles
+/// serde_json with `preserve_order` and this crate does not, so before the
+/// schema-ordered encoder the two builds encoded the same composite key to
+/// different strings. Membership keys, delete ids, and realtime topics all key
+/// off this string, so the two builds have to agree byte for byte.
+#[cfg(feature = "platform-probes")]
+#[wasm_bindgen]
+pub fn canonical_pk_probe(input: JsValue) -> Result<String, JsValue> {
+    let input: CanonicalPkProbe = serde_wasm_bindgen::from_value(input).map_err(js_err)?;
+    let spec = sync_core::TableSpec {
+        columns: input
+            .primary_key
+            .iter()
+            .map(|c| (c.clone(), sync_core::ZeroColumnType::String))
+            .collect(),
+        primary_key: input.primary_key,
+        encrypted_columns: Default::default(),
+        encrypted_physical_columns: Default::default(),
+    };
+    Ok(sync_core::canonical_pk(&spec, &input.pk))
+}
+
+// ---- production sync-core boundary ---------------------------------------
+
+fn from_js<T: for<'de> Deserialize<'de>>(value: JsValue) -> Result<T, JsValue> {
+    serde_wasm_bindgen::from_value(value).map_err(js_err)
+}
+
+fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_err)
+}
+
+fn engine_error(error: sync_core::EngineError) -> JsValue {
+    let js_error = js_sys::Error::new(&error.message);
+    let _ = js_sys::Reflect::set(
+        js_error.as_ref(),
+        &JsValue::from_str("status"),
+        &JsValue::from_f64(f64::from(error.status)),
+    );
+    js_error.into()
+}
+
+fn query_json_from_js(value: JsValue, name: &str) -> Result<serde_json::Value, JsValue> {
+    serde_wasm_bindgen::from_value(value).map_err(|error| {
+        engine_error(sync_core::EngineError::bad_request(format!(
+            "query {name} is malformed: {error}"
+        )))
+    })
+}
+
+fn tables_from_js(schema: JsValue) -> Result<sync_core::Tables, JsValue> {
+    let schema: serde_json::Value = from_js(schema)?;
+    sync_core::Tables::from_zero_schema(&schema).map_err(js_err)
+}
+
+fn parse_counter(value: &str, name: &str) -> Result<i64, JsValue> {
+    value
+        .parse::<i64>()
+        .map_err(|error| js_err(format!("invalid {name} {value:?}: {error}")))
+}
+
+/// Initialize the sync engine's durable metadata and triggers. The host calls
+/// this inside startup `transactionSync` after application DDL and seed.
+#[wasm_bindgen]
+pub fn engine_init_schema(db: &JsSyncDb, schema: JsValue) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    sync_core::init_schema(&mut db, &tables).map_err(js_err)
+}
+
+/// Apply one ordered page from the upstream ZeroSqlDO change feed. The host
+/// owns one transaction around this call; application triggers append the
+/// ordinary engine change-log entries consumed by pull/CVR code.
+#[wasm_bindgen]
+pub fn engine_apply_upstream(
+    db: &JsSyncDb,
+    schema: JsValue,
+    batch: JsValue,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let batch: sync_core::UpstreamBatch = from_js(batch)?;
+    let result = sync_core::apply_upstream(&mut db, &tables, &batch).map_err(engine_error)?;
+    to_js(&result)
+}
+
+/// Atomically rebuild application rows from a point-in-time upstream snapshot.
+#[wasm_bindgen]
+pub fn engine_apply_upstream_snapshot(
+    db: &JsSyncDb,
+    schema: JsValue,
+    snapshot: JsValue,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let snapshot: sync_core::UpstreamSnapshot = from_js(snapshot)?;
+    let result =
+        sync_core::apply_upstream_snapshot(&mut db, &tables, &snapshot).map_err(engine_error)?;
+    to_js(&result)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotProgressWire {
+    generation: String,
+    start_watermark: String,
+    table: Option<String>,
+    cursor: Option<String>,
+    state: sync_core::SnapshotState,
+    catchup_watermark: String,
+}
+
+impl From<sync_core::SnapshotProgress> for SnapshotProgressWire {
+    fn from(progress: sync_core::SnapshotProgress) -> Self {
+        Self {
+            generation: progress.generation.to_string(),
+            start_watermark: progress.start_watermark.to_string(),
+            table: progress.table,
+            cursor: progress.cursor,
+            state: progress.state,
+            catchup_watermark: progress.catchup_watermark.to_string(),
+        }
+    }
+}
+
+/// Strictly read resumable snapshot progress. Storage and row-shape failures
+/// are errors; only a successful query with no active row returns null.
+#[wasm_bindgen]
+pub fn engine_read_snapshot_progress(db: &JsSyncDb) -> Result<JsValue, JsValue> {
+    let progress = sync_core::read_snapshot_progress(&mut WasmDb(db)).map_err(engine_error)?;
+    to_js(&progress.map(SnapshotProgressWire::from))
+}
+
+/// Create a new staged generation. `start_watermark` is captured by the host
+/// from the first source snapshot-page response. The host owns the transaction.
+#[wasm_bindgen]
+pub fn engine_begin_snapshot_generation(
+    db: &JsSyncDb,
+    schema: JsValue,
+    start_watermark: &str,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let start_watermark = parse_counter(start_watermark, "snapshot start watermark")?;
+    let progress = sync_core::begin_snapshot_generation(&mut db, &tables, start_watermark)
+        .map_err(engine_error)?;
+    to_js(&SnapshotProgressWire::from(progress))
+}
+
+/// Apply one bounded source page to staging and commit its opaque cursor with
+/// the rows. The host owns one transaction per call.
+#[wasm_bindgen]
+pub fn engine_apply_snapshot_page(
+    db: &JsSyncDb,
+    schema: JsValue,
+    generation: &str,
+    table: &str,
+    rows: JsValue,
+    next_cursor: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let generation = parse_counter(generation, "snapshot generation")?;
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> = from_js(rows)?;
+    let progress = sync_core::apply_snapshot_page(
+        &mut db,
+        &tables,
+        generation,
+        table,
+        &rows,
+        next_cursor.as_deref(),
+    )
+    .map_err(engine_error)?;
+    to_js(&SnapshotProgressWire::from(progress))
+}
+
+/// Apply one ordered catch-up page to staging without touching the live table
+/// namespace or live upstream watermark.
+#[wasm_bindgen]
+pub fn engine_apply_snapshot_changes(
+    db: &JsSyncDb,
+    schema: JsValue,
+    generation: &str,
+    batch: JsValue,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let generation = parse_counter(generation, "snapshot generation")?;
+    let batch: sync_core::UpstreamBatch = from_js(batch)?;
+    let result = sync_core::apply_snapshot_changes(&mut db, &tables, generation, &batch)
+        .map_err(engine_error)?;
+    to_js(&result)
+}
+
+/// Atomically rename a drained staged generation into the live namespace,
+/// invalidate pre-cutover client cookies, and advance the live source cursor.
+#[wasm_bindgen]
+pub fn engine_finalize_snapshot_generation(
+    db: &JsSyncDb,
+    schema: JsValue,
+    generation: &str,
+    watermark: &str,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let tables = tables_from_js(schema)?;
+    let generation = parse_counter(generation, "snapshot generation")?;
+    let watermark = parse_counter(watermark, "snapshot drain watermark")?;
+    let result = sync_core::finalize_snapshot_generation(&mut db, &tables, generation, watermark)
+        .map_err(engine_error)?;
+    to_js(&result)
+}
+
+/// Initialize the additive query-aware durable tables. The host owns the
+/// transaction boundary, exactly as it does for the baseline schema.
+#[wasm_bindgen]
+pub fn engine_init_query_schema(db: &JsSyncDb) -> Result<(), JsValue> {
+    sync_core::query::init_query_schema(&mut WasmDb(db)).map_err(js_err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompiledQueryPlanWire {
+    root_table: String,
+    plan_hash: String,
+    root: CompiledQueryNodeWire,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompiledQueryNodeWire {
+    table: String,
+    singular: bool,
+    sql: String,
+    bindings: Vec<QueryBindingWire>,
+    columns: Vec<QueryColumnWire>,
+    relationships: Vec<CompiledRelationshipWire>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompiledRelationshipWire {
+    name: String,
+    node: CompiledQueryNodeWire,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryColumnWire {
+    name: String,
+    column_type: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum QueryBindingWire {
+    Literal { value: WireValue },
+    ParentField { field: String },
+}
+
+fn query_column_type(column_type: sync_core::value::ZeroColumnType) -> &'static str {
+    use sync_core::value::ZeroColumnType;
+    match column_type {
+        ZeroColumnType::String => "string",
+        ZeroColumnType::Number => "number",
+        ZeroColumnType::Boolean => "boolean",
+        ZeroColumnType::Json => "json",
+        ZeroColumnType::Null => "null",
+    }
+}
+
+fn query_node_wire(node: sync_core::query::CompiledQueryNode) -> CompiledQueryNodeWire {
+    CompiledQueryNodeWire {
+        table: node.table,
+        singular: node.singular,
+        sql: node.sql,
+        bindings: node
+            .bindings
+            .into_iter()
+            .map(|binding| match binding {
+                sync_core::query::QueryBinding::Literal(value) => QueryBindingWire::Literal {
+                    value: WireValue::from(&value),
+                },
+                sync_core::query::QueryBinding::ParentField(field) => {
+                    QueryBindingWire::ParentField { field }
+                }
+            })
+            .collect(),
+        columns: node
+            .columns
+            .into_iter()
+            .map(|column| QueryColumnWire {
+                name: column.name,
+                column_type: query_column_type(column.column_type),
+            })
+            .collect(),
+        relationships: node
+            .relationships
+            .into_iter()
+            .map(|relationship| CompiledRelationshipWire {
+                name: relationship.name,
+                node: query_node_wire(relationship.node),
+            })
+            .collect(),
+    }
+}
+
+/// Compile a validated Zero query AST for a consumer mutator's transactional
+/// `tx.run(...)`. Execution remains in the host-owned application transaction.
+#[wasm_bindgen]
+pub fn engine_compile_query(
+    schema: JsValue,
+    ast: JsValue,
+    format: JsValue,
+) -> Result<JsValue, JsValue> {
+    let schema_json = query_json_from_js(schema, "schema")?;
+    let tables = sync_core::Tables::from_zero_schema(&schema_json).map_err(js_err)?;
+    let schema = sync_core::query::parse_query_schema(&schema_json).map_err(engine_error)?;
+    let ast = query_json_from_js(ast, "AST")?;
+    let ast = sync_core::query::parse_ast(&ast).map_err(engine_error)?;
+    let format = query_json_from_js(format, "format")?;
+    let format = sync_core::query::parse_query_format(&format).map_err(engine_error)?;
+    let compiled = sync_core::query::compile_transaction_query(&schema, &tables, &ast, &format)
+        .map_err(engine_error)?;
+    to_js(&CompiledQueryPlanWire {
+        root_table: compiled.root_table,
+        plan_hash: compiled.plan_hash,
+        root: query_node_wire(compiled.root),
+    })
+}
+
+/// Production pull entry point. Desired-query ASTs are already resolved and
+/// validated by the consumer host before crossing this boundary.
+#[wasm_bindgen]
+pub fn engine_handle_query_pull(
+    db: &JsSyncDb,
+    schema: JsValue,
+    retain_changes: &str,
+    body: JsValue,
+    user_id: &str,
+) -> Result<JsValue, JsValue> {
+    let tables = tables_from_js(schema)?;
+    let body: serde_json::Value = from_js(body)?;
+    sync_core::query::handle_query_pull(
+        &mut WasmDb(db),
+        &tables,
+        parse_counter(retain_changes, "retention count")?,
+        &body,
+        user_id,
+    )
+    .map_err(engine_error)
+    .and_then(|value| to_js(&value))
+}
+
+/// The clients a wake after an ingest should reach: every client whose group
+/// can see a row committed after `since`. `{ all: true }` means wake every
+/// socket; otherwise `clientIDs` lists the clients to wake. Call it with a
+/// transaction open, after the ingest that advanced past `since`.
+#[wasm_bindgen]
+pub fn engine_wake_targets(
+    db: &JsSyncDb,
+    schema: JsValue,
+    since: &str,
+) -> Result<JsValue, JsValue> {
+    let tables = tables_from_js(schema)?;
+    let since = parse_counter(since, "wake watermark")?;
+    let targets =
+        sync_core::query::wake_targets(&mut WasmDb(db), &tables, since).map_err(engine_error)?;
+    let wire = match targets {
+        sync_core::query::WakeTargets::All => serde_json::json!({ "all": true }),
+        sync_core::query::WakeTargets::Clients(clients) => {
+            serde_json::json!({ "all": false, "clientIDs": clients })
+        }
+    };
+    to_js(&wire)
+}
+
+/// Authorize a realtime field subscription.
+///
+/// Answers the one question a host needs before it will stream a row's field to
+/// a client: does this client group's own durable query membership already
+/// deliver that row, and does the group belong to the authenticated user?
+///
+/// A negative answer is not always a denial. `authorized: false` with
+/// `ownsGroup: true` is the optimistic-row race, where the client legitimately
+/// holds a row from its own mutation that the server has not recorded
+/// membership for yet; the host answers that subscription pending and the
+/// client retries after its next pull. `ownsGroup: false` is a real denial.
+#[wasm_bindgen]
+pub fn engine_authorize_realtime_subscription(
+    db: &JsSyncDb,
+    schema: JsValue,
+    client_group_id: &str,
+    user_id: &str,
+    table: &str,
+    pk: JsValue,
+) -> Result<JsValue, JsValue> {
+    let tables = tables_from_js(schema)?;
+    let pk: serde_json::Value = from_js(pk)?;
+    let mut db = WasmDb(db);
+    let owns_group = sync_core::query::group_belongs_to_user(&mut db, client_group_id, user_id)
+        .map_err(engine_error)?;
+    // never consult membership for a group the caller does not own: a group id
+    // is not a bearer token
+    let authorized = owns_group
+        && sync_core::query::row_membership(&mut db, &tables, client_group_id, table, &pk)
+            .map_err(engine_error)?;
+    to_js(&serde_json::json!({ "ownsGroup": owns_group, "authorized": authorized }))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PushPlanWire {
+    Respond {
+        response: serde_json::Value,
+    },
+    Process {
+        #[serde(rename = "clientGroupID")]
+        client_group_id: String,
+        mutations: Vec<PushMutationWire>,
+    },
+}
+
+#[derive(Serialize)]
+struct PushMutationWire {
+    id: String,
+    #[serde(rename = "clientID")]
+    client_id: String,
+    name: String,
+    args: Vec<serde_json::Value>,
+}
+
+/// Validate an entire push before the host opens the first mutation tx.
+#[wasm_bindgen]
+pub fn engine_push_validate(body: JsValue) -> Result<JsValue, JsValue> {
+    let body: serde_json::Value = from_js(body)?;
+    let plan = match sync_core::push_validate(&body).map_err(engine_error)? {
+        sync_core::PushPlan::Respond(response) => PushPlanWire::Respond { response },
+        sync_core::PushPlan::Process(body) => PushPlanWire::Process {
+            client_group_id: body.client_group_id,
+            mutations: body
+                .mutations
+                .into_iter()
+                .map(|mutation| PushMutationWire {
+                    id: mutation.id.to_string(),
+                    client_id: mutation.client_id,
+                    name: mutation.name,
+                    args: mutation.args,
+                })
+                .collect(),
+        },
+    };
+    to_js(&plan)
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PreflightWire {
+    Applied,
+    Replay { expected: String },
+}
+
+#[wasm_bindgen]
+pub fn engine_preflight(
+    db: &JsSyncDb,
+    client_group_id: &str,
+    client_id: &str,
+    mutation_id: &str,
+    user_id: &str,
+) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    let result = sync_core::preflight(
+        &mut db,
+        client_group_id,
+        client_id,
+        parse_counter(mutation_id, "mutation id")?,
+        user_id,
+    )
+    .map_err(engine_error)?;
+    to_js(&match result {
+        sync_core::Preflight::Applied => PreflightWire::Applied,
+        sync_core::Preflight::Replay { expected } => PreflightWire::Replay {
+            expected: expected.to_string(),
+        },
+    })
+}
+
+#[wasm_bindgen]
+pub fn engine_finalize(
+    db: &JsSyncDb,
+    client_group_id: &str,
+    client_id: &str,
+    mutation_id: &str,
+) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    sync_core::finalize(
+        &mut db,
+        client_group_id,
+        client_id,
+        parse_counter(mutation_id, "mutation id")?,
+    )
+    .map_err(engine_error)
+}
+
+#[wasm_bindgen]
+pub fn engine_record_app_error(
+    db: &JsSyncDb,
+    client_group_id: &str,
+    client_id: &str,
+    mutation_id: &str,
+    user_id: &str,
+) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    sync_core::record_app_error(
+        &mut db,
+        client_group_id,
+        client_id,
+        parse_counter(mutation_id, "mutation id")?,
+        user_id,
+    )
+    .map_err(engine_error)
+}
+
+#[wasm_bindgen]
+pub fn engine_prune(db: &JsSyncDb, retain_changes: &str) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    sync_core::prune(&mut db, parse_counter(retain_changes, "retention count")?)
+        .map_err(engine_error)
+}
+
+#[wasm_bindgen]
+pub fn engine_invalidate(db: &JsSyncDb) -> Result<(), JsValue> {
+    let mut db = WasmDb(db);
+    sync_core::invalidate(&mut db).map_err(engine_error)
+}
+
+#[derive(Deserialize)]
+struct MutationResultWire {
+    #[serde(rename = "clientID")]
+    client_id: String,
+    id: String,
+    result: serde_json::Value,
+}
+
+#[wasm_bindgen]
+pub fn engine_assemble_push_response(results: JsValue) -> Result<JsValue, JsValue> {
+    let results: Vec<MutationResultWire> = from_js(results)?;
+    let results = results
+        .into_iter()
+        .map(|result| {
+            Ok(sync_core::MutationResult {
+                client_id: result.client_id,
+                id: parse_counter(&result.id, "mutation id")?,
+                result: result.result,
+            })
+        })
+        .collect::<Result<Vec<_>, JsValue>>()?;
+    to_js(&sync_core::assemble_push_response(results))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineStateWire {
+    watermark: String,
+    floor: String,
+    upstream_watermark: String,
+}
+
+#[wasm_bindgen]
+pub fn engine_state(db: &JsSyncDb) -> Result<JsValue, JsValue> {
+    let mut db = WasmDb(db);
+    to_js(&EngineStateWire {
+        watermark: sync_core::watermark(&mut db)
+            .map_err(engine_error)?
+            .to_string(),
+        floor: sync_core::pull::floor(&mut db)
+            .map_err(engine_error)?
+            .to_string(),
+        upstream_watermark: sync_core::upstream_watermark(&mut db)
+            .map_err(engine_error)?
+            .to_string(),
+    })
+}
+
+#[wasm_bindgen]
+pub fn engine_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Identity of the durable DDL this engine build installs. Hosts fold it into
+/// the fingerprint that lets an up-to-date namespace skip the schema pass.
+#[wasm_bindgen]
+pub fn engine_schema_revision() -> String {
+    sync_core::schema_revision()
+}
+
+/// Linear-memory size for authenticated operator soak diagnostics. This is a
+/// byte count only; it contains no application or query data.
+#[wasm_bindgen]
+pub fn engine_memory_bytes() -> Result<u32, JsValue> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let memory = wasm_bindgen::memory()
+            .dyn_into::<js_sys::WebAssembly::Memory>()
+            .map_err(|_| js_err("wasm linear memory is unavailable"))?;
+        let buffer = memory
+            .buffer()
+            .dyn_into::<js_sys::ArrayBuffer>()
+            .map_err(|_| js_err("wasm memory buffer is unavailable"))?;
+        return Ok(buffer.byte_length());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    Err(js_err("wasm memory diagnostics require wasm32"))
+}

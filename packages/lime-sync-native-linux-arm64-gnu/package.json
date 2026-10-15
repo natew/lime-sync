@@ -1,0 +1,26 @@
+{
+  "name": "lime-sync-native-linux-arm64-gnu",
+  "version": "0.1.6",
+  "description": "Prebuilt Orez sync-native host for Linux ARM64 glibc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natew/lime-sync.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin",
+    "LICENSES.txt"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

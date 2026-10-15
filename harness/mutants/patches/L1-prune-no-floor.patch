@@ -1,0 +1,15 @@
+diff --git a/crates/sync-core/src/store.rs b/crates/sync-core/src/store.rs
+index 2897fad5..505d405e 100644
+--- a/crates/sync-core/src/store.rs
++++ b/crates/sync-core/src/store.rs
+@@ -85,10 +85,6 @@ pub(crate) fn prune_known(
+         return Ok(floor);
+     }
+     ledger::prune(db, cutoff)?;
+-    db.exec(
+-        "UPDATE _zsync_meta SET floor = ? WHERE lock = 1",
+-        &[counter(cutoff)],
+-    )?;
+     Ok(cutoff)
+ }
+ 

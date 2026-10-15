@@ -1,0 +1,17 @@
+{
+  "comment": "expected mutation-matrix outcomes; the nightly gate fails when a mutant listed as caught goes uncaught. update this file (and docs/sync/mutation-matrix.md) when coverage genuinely changes.",
+  "caught": {
+    "Q1-ignore-and-branch": true,
+    "Q2-orderby-flip": true,
+    "Q3-limit-off-by-one": true,
+    "Q4-related-window-drop": true,
+    "M1-skip-finalize": true,
+    "M2-replay-double-apply": true,
+    "M3-swallow-rollback": true,
+    "L1-prune-no-floor": true,
+    "O1-nondurable-watermark": true,
+    "H1-backup-scan-without-read-session": true,
+    "H2-admit-writer-with-reader-open": true,
+    "H3-skip-pending-change-promotion": true
+  }
+}

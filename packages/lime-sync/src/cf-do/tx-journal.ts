@@ -1,0 +1,1295 @@
+/**
+ * durable transaction journal for the DO SQL backend.
+ *
+ * Durable Object RPC transactions apply writes eagerly. Parsed DML is rolled back from the
+ * CDC row before-images captured by the same SQLite statement; unknown writes
+ * fall back to a first-write table snapshot (`_orez_tx_<txID>_*`). Before this
+ * journal, the rollback bookkeeping lived only in the client's memory: a DO eviction or
+ * deploy upgrade-kill mid-transaction persisted the partial writes forever
+ * (the 2026-06 poisoned cdc changeLog incident — zero's catchup replays
+ * begin→data→begin and the replicator wedges permanently).
+ *
+ * the journal makes the snapshot bookkeeping durable and the commit point
+ * atomic:
+ *
+ *   - every row-journal marker or fallback snapshot is recorded in
+ *     `_orez_tx_manifest` atomically with its rollback state.
+ *   - COMMIT = one atomic storage transaction that drops rollback state and
+ *     deletes the manifest rows (plus promoting pending tracked changes in
+ *     ZeroDO). a tx is committed if and only if its manifest rows are gone.
+ *   - ROLLBACK = one atomic storage transaction that restores row before-images
+ *     plus any fallback table snapshots (in reverse order).
+ *   - RECOVERY (`recoverTxJournal`) rolls back every manifest tx for an
+ *     owner whose process generation is known dead (e.g. the zero-cache
+ *     embed at boot, before it opens any pg session), so a partial tx is
+ *     invisible on the next boot.
+ *
+ * all functions are synchronous over a minimal sql-exec interface so the
+ * same core runs inside ZeroDO's ctx.storage.transaction() and inside the
+ * embed-local backend's transactionSync().
+ */
+
+import {
+  journalValueSqlBinding,
+  restoreTriggers,
+  suspendTriggers,
+  tableIdentity,
+} from './cdc.js'
+
+import type { DurableSqlStorage } from './watermark.js'
+
+export const TX_MANIFEST_TABLE = '_orez_tx_manifest'
+export const TX_SCHEMA_TABLE = '_orez_tx_schema'
+
+export const TX_MANIFEST_DDL =
+  `CREATE TABLE IF NOT EXISTS "${TX_MANIFEST_TABLE}" (` +
+  'seq INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+  'tx_id TEXT NOT NULL, ' +
+  "owner TEXT NOT NULL DEFAULT 'default', " +
+  'original TEXT NOT NULL, ' +
+  'snapshot TEXT, snapshot_state TEXT)'
+
+export const TX_SCHEMA_DDL =
+  `CREATE TABLE IF NOT EXISTS "${TX_SCHEMA_TABLE}" (` +
+  'seq INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+  'tx_id TEXT NOT NULL, ' +
+  "owner TEXT NOT NULL DEFAULT 'default', " +
+  'type TEXT NOT NULL, ' +
+  'name TEXT NOT NULL, ' +
+  'tbl_name TEXT NOT NULL, ' +
+  'sql TEXT)'
+
+/**
+ * The cdc registration table. It stays in INTERNAL_TABLES -- ordinary row-level
+ * undo must not touch it -- and the schema restore carves it out explicitly
+ * instead; see `snapshotCdcRegistration`.
+ */
+const CDC_REGISTRATION_TABLE = '_orez_cdc_tables'
+
+/**
+ * Where row-undo keeps its before/after images. Declared here rather than in
+ * row-undo so both modules name one constant: row-undo already imports from
+ * this file, and the classifier below has to read the table to refuse a
+ * mid-transaction snapshot.
+ */
+export const PENDING_CHANGES_TABLE = '_zero_pending_changes'
+
+/**
+ * the retired zero-http engine's change journal. its `_zsync_tr_*` AFTER
+ * triggers wrote it on every synced application write until the engine was
+ * deleted on 2026-07-29; the DO now drops the triggers and the table at boot
+ * (`dropZeroHttpJournalResidue` in worker.ts), and this constant names what
+ * that cleanup removes.
+ */
+export const ZSYNC_CHANGES_TABLE = '_zsync_changes'
+
+/**
+ * the packed mutation ledger. the sync executor toggles its captureMode column
+ * mid-transaction through plain sql with no statement metadata, so no tracked
+ * write ever registers it for capture, and its identity is fixed and
+ * orez-owned. the worker registers it rollback-only before any
+ * statement that writes it: an application session abandoned mid-transaction (a
+ * delegated push canceled by the sync host's per-attempt timeout) must restore
+ * captureMode, or every later push fails preparePackedLedger with "packed
+ * ledger has uncommitted capture state" and the namespace never recovers
+ * (production example apps, 2026-08-03).
+ */
+export const ZSYNC_LOG_SEGMENTS_TABLE = '_zsync_log_segments'
+
+const INTERNAL_TABLES = new Set([
+  TX_MANIFEST_TABLE,
+  TX_SCHEMA_TABLE,
+  CDC_REGISTRATION_TABLE,
+  '_orez_cdc_buffer',
+  PENDING_CHANGES_TABLE,
+  '_zero_changes',
+  '_zero_change_state',
+  '_zero_schema_tables',
+])
+
+function isInternalObject(name: string): boolean {
+  return (
+    INTERNAL_TABLES.has(name) ||
+    name.startsWith('_cf_') ||
+    name.startsWith('_orez_tx_') ||
+    name.startsWith('_orez_bk_') ||
+    name.startsWith('sqlite_')
+  )
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`
+}
+
+interface ManifestRow {
+  seq: number
+  txId: string
+  original: string
+  snapshot: string | null
+  state: unknown
+}
+
+function manifestTableExists(sql: DurableSqlStorage): boolean {
+  return (
+    sql
+      .exec(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?",
+        TX_MANIFEST_TABLE
+      )
+      .toArray().length > 0
+  )
+}
+
+function tableExists(sql: DurableSqlStorage, name: string): boolean {
+  return (
+    sql
+      .exec("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?", name)
+      .toArray().length > 0
+  )
+}
+
+function schemaTableExists(sql: DurableSqlStorage): boolean {
+  return (
+    sql
+      .exec(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?",
+        TX_SCHEMA_TABLE
+      )
+      .toArray().length > 0
+  )
+}
+
+interface SchemaRow {
+  seq: number
+  type: string
+  name: string
+  table: string
+  sql: string | null
+}
+
+function schemaRows(sql: DurableSqlStorage, txID: string): SchemaRow[] {
+  if (!schemaTableExists(sql)) return []
+  return sql
+    .exec(
+      `SELECT seq, type, name, tbl_name, sql FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ? ORDER BY seq`,
+      txID
+    )
+    .toArray()
+    .map((row) => ({
+      seq: Number(row.seq),
+      type: String(row.type),
+      name: String(row.name),
+      table: String(row.tbl_name),
+      sql: row.sql === null || row.sql === undefined ? null : String(row.sql),
+    }))
+}
+
+interface SchemaSnapshotObject {
+  type: string
+  name: string
+  table: string
+  sql: string
+}
+
+interface CdcRegistrationSnapshot {
+  columns_json: string
+  physical_table: string
+  publish: number
+  schema_version: number
+  table_name: string
+}
+
+interface ParsedSchemaSnapshot {
+  present: boolean
+  objects: SchemaSnapshotObject[]
+  cdc: CdcRegistrationSnapshot[]
+}
+
+/**
+ * Cloudflare bills every journal row this snapshot writes and every one its
+ * commit deletes, and a production-sized namespace has hundreds of
+ * sqlite_master objects, so the per-object encoding made the snapshot the
+ * dominant cost of any transaction containing DDL: 86% of a measured
+ * stale-namespace migration replay was this bookkeeping. The snapshot is now
+ * one JSON row per ~1MB of schema (one row for any realistic schema; Durable
+ * Object SQLite caps a row at 2MB).
+ *
+ * A journal written by the previous worker version can still be recovered
+ * after a deploy kills its transaction, so this reader accepts both the JSON
+ * rows and the legacy one-row-per-object encoding.
+ */
+function readSchemaSnapshot(sql: DurableSqlStorage, txID: string): ParsedSchemaSnapshot {
+  const rows = schemaRows(sql, txID)
+  const jsonRows = rows.filter((row) => row.type === 'schema' && row.sql)
+  if (jsonRows.length > 0) {
+    const objects: SchemaSnapshotObject[] = []
+    const cdc: CdcRegistrationSnapshot[] = []
+    for (const row of jsonRows) {
+      const chunk = JSON.parse(row.sql!) as {
+        objects?: SchemaSnapshotObject[]
+        cdc?: CdcRegistrationSnapshot[]
+      }
+      for (const object of chunk.objects ?? []) objects.push(object)
+      for (const registration of chunk.cdc ?? []) cdc.push(registration)
+    }
+    return { present: true, objects, cdc }
+  }
+  if (!rows.some((row) => row.type === 'marker')) {
+    return { present: false, objects: [], cdc: [] }
+  }
+  return {
+    present: true,
+    objects: rows
+      .filter(
+        (row) =>
+          row.type !== 'marker' && row.type !== 'active' && row.type !== 'cdc' && row.sql
+      )
+      .map((row) => ({
+        type: row.type,
+        name: row.name,
+        table: row.table,
+        sql: row.sql!,
+      })),
+    cdc: rows
+      .filter((row) => row.type === 'cdc' && row.sql)
+      .map((row) => JSON.parse(row.sql!) as CdcRegistrationSnapshot),
+  }
+}
+
+function manifestRows(sql: DurableSqlStorage, txID: string): ManifestRow[] {
+  const rows = sql
+    .exec(`SELECT * FROM "${TX_MANIFEST_TABLE}" WHERE tx_id = ? ORDER BY seq`, txID)
+    .toArray()
+    .map((row) => ({
+      seq: Number(row.seq),
+      txId: String(row.tx_id),
+      original: String(row.original),
+      snapshot:
+        row.snapshot === null || row.snapshot === undefined ? null : String(row.snapshot),
+      state: row.snapshot_state,
+    }))
+  const tables = new Set<string>()
+  for (const row of rows) {
+    if (tables.has(row.original))
+      throw new Error(
+        `transaction snapshot has duplicate manifest table: ${row.original}`
+      )
+    tables.add(row.original)
+  }
+  return rows
+}
+
+function dropTable(sql: DurableSqlStorage, table: string): void {
+  sql.exec(`DROP TABLE IF EXISTS ${quoteIdent(table)}`)
+}
+
+interface TableSnapshotRestore {
+  row: ManifestRow
+  columnList: string
+  sequence: false | null | ReturnType<typeof journalValueSqlBinding>
+}
+
+// both consumers validate the original table shape and stored identity before
+// restoring rows. legacy hidden identities and allocators cannot be inferred.
+function prepareTableSnapshotRestore(
+  sql: DurableSqlStorage,
+  row: ManifestRow
+): TableSnapshotRestore {
+  const identity = tableIdentity(sql, row.original)
+  if (
+    !identity ||
+    (!identity.withoutRowid && !identity.rowidColumn && !identity.rowidAlias)
+  ) {
+    throw new Error(`transaction snapshot has inaccessible row identity: ${row.original}`)
+  }
+  const hidden =
+    !identity.withoutRowid && !identity.rowidColumn ? identity.rowidAlias : null
+  const versioned =
+    row.snapshot === `_orez_tx_undo_v2_${row.seq}` &&
+    Number.isSafeInteger(row.seq) &&
+    row.seq > 0
+  if (!versioned && row.snapshot?.startsWith('_orez_tx_undo_v')) {
+    throw new Error(
+      `transaction snapshot version/name does not match manifest: ${row.original}`
+    )
+  }
+  let sequence: TableSnapshotRestore['sequence'] = false
+  if (versioned) {
+    if (typeof row.state !== 'string') {
+      throw new Error(
+        `transaction snapshot metadata does not match manifest: ${row.original}`
+      )
+    }
+    const saved: unknown = JSON.parse(row.state)
+    if (
+      !saved ||
+      typeof saved !== 'object' ||
+      Array.isArray(saved) ||
+      !('version' in saved) ||
+      saved.version !== 2 ||
+      !('table' in saved) ||
+      saved.table !== row.original ||
+      !('rowid' in saved) ||
+      saved.rowid !== hidden ||
+      !('sequence' in saved) ||
+      Object.keys(saved).length !== 4
+    ) {
+      throw new Error(
+        `transaction snapshot identity metadata is corrupt: ${row.original}`
+      )
+    }
+    if (identity.autoIncrement) {
+      if (saved.sequence === null) sequence = null
+      else if (typeof saved.sequence === 'string' && saved.sequence.startsWith('i')) {
+        sequence = journalValueSqlBinding(saved.sequence)
+      } else
+        throw new Error(
+          `transaction snapshot allocator metadata is corrupt: ${row.original}`
+        )
+    } else if (saved.sequence !== false) {
+      throw new Error(
+        `transaction snapshot allocator does not match table: ${row.original}`
+      )
+    }
+  } else {
+    if (row.state !== null && row.state !== undefined)
+      throw new Error(
+        `legacy transaction snapshot has versioned metadata: ${row.original}`
+      )
+    if (identity.autoIncrement) {
+      throw new Error(
+        `legacy transaction snapshot lacks allocator state: ${row.original}`
+      )
+    }
+    if (
+      hidden &&
+      sql.exec(`SELECT 1 FROM ${quoteIdent(row.snapshot!)} LIMIT 1`).toArray().length
+    ) {
+      throw new Error(
+        `legacy transaction snapshot lacks hidden row identity: ${row.original}`
+      )
+    }
+  }
+  const copiedColumns = sql
+    .exec(`PRAGMA table_xinfo(${quoteIdent(row.snapshot!)})`)
+    .toArray()
+    .map((column) => column.name)
+  const expectedColumns =
+    versioned && hidden ? [hidden, ...identity.columns] : identity.columns
+  if (
+    copiedColumns.length !== expectedColumns.length ||
+    copiedColumns.some((column, index) => column !== expectedColumns[index])
+  ) {
+    throw new Error(
+      `transaction snapshot columns do not match original table: ${row.original}`
+    )
+  }
+  const integerColumn = versioned
+    ? (hidden ?? identity.rowidColumn)
+    : identity.rowidColumn
+  if (
+    integerColumn &&
+    sql
+      .exec(
+        `SELECT 1 FROM ${quoteIdent(row.snapshot!)} WHERE typeof(${quoteIdent(integerColumn)}) != 'integer' LIMIT 1`
+      )
+      .toArray().length
+  ) {
+    throw new Error(
+      `transaction snapshot row identity is not an integer: ${row.original}`
+    )
+  }
+  const columns =
+    versioned && hidden ? [hidden, ...identity.writableColumns] : identity.writableColumns
+  return { row, columnList: columns.map(quoteIdent).join(', '), sequence }
+}
+
+function restoreTableSnapshot(
+  sql: DurableSqlStorage,
+  restore: TableSnapshotRestore
+): void {
+  const { row, columnList, sequence } = restore
+  sql.exec(
+    `INSERT INTO ${quoteIdent(row.original)} (${columnList}) SELECT ${columnList} FROM ${quoteIdent(row.snapshot!)}`
+  )
+  if (sequence !== false) {
+    // only this table's allocator belongs to its image. journal allocators and
+    // unrelated application sequences remain owned by their own transactions.
+    sql.exec('DELETE FROM sqlite_sequence WHERE name = ?', row.original)
+    if (sequence !== null)
+      sql.exec(
+        `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ${sequence.expr})`,
+        row.original,
+        ...sequence.params
+      )
+  }
+}
+
+/** Parent snapshots must restore before children so FK cascades cannot erase a restored child. */
+function parentFirst(sql: DurableSqlStorage, rows: ManifestRow[]): ManifestRow[] {
+  const byTable = new Map(rows.map((row) => [row.original, row]))
+  const edges = new Map(rows.map((row) => [row.original, new Set<string>()]))
+  const incoming = new Map(rows.map((row) => [row.original, 0]))
+  for (const child of rows) {
+    const parents = sql
+      .exec(`PRAGMA foreign_key_list(${quoteIdent(child.original)})`)
+      .toArray()
+      .map((row) => String(row.table ?? ''))
+    for (const parent of new Set(parents)) {
+      if (!byTable.has(parent) || parent === child.original) continue
+      const children = edges.get(parent)!
+      if (children.has(child.original)) continue
+      children.add(child.original)
+      incoming.set(child.original, (incoming.get(child.original) ?? 0) + 1)
+    }
+  }
+
+  const ready = rows.filter((row) => incoming.get(row.original) === 0)
+  const ordered: ManifestRow[] = []
+  while (ready.length > 0) {
+    const row = ready.shift()!
+    ordered.push(row)
+    for (const child of edges.get(row.original) ?? []) {
+      const count = (incoming.get(child) ?? 0) - 1
+      incoming.set(child, count)
+      if (count === 0) ready.push(byTable.get(child)!)
+    }
+  }
+  // Cyclic foreign keys are checked at the surrounding transaction boundary;
+  // retain deterministic manifest order for the strongly connected remainder.
+  for (const row of rows) if (!ordered.includes(row)) ordered.push(row)
+  return ordered
+}
+
+/**
+ * true when restoreSchemaSnapshot will rebuild `table` during the rollback of
+ * `txID`: the tx recorded a transactional-DDL schema marker and the table was
+ * created, dropped, or DDL-changed since the schema snapshot. row-level undo
+ * consults this to skip such tables — their pre-tx content comes back
+ * wholesale from the table snapshot, and undoing rows against a dropped or
+ * rebuilt table either throws or targets the wrong shape. before this,
+ * recovery of a tx killed mid table rebuild threw on every boot and wedged
+ * the namespace permanently (2026-07-24 prod fresh-project incident).
+ */
+export function schemaRestoreOwnsTable(
+  sql: DurableSqlStorage,
+  txID: string,
+  table: string
+): boolean {
+  const snapshot = readSchemaSnapshot(sql, txID)
+  if (!snapshot.present) return false
+  const original = snapshot.objects.find(
+    (object) => object.type === 'table' && object.name === table
+  )
+  const current = sql
+    .exec(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ? AND sql IS NOT NULL`,
+      table
+    )
+    .toArray()[0]
+  if (!original || !current) return true
+  return original.sql !== String(current.sql ?? '')
+}
+
+/**
+ * Capture the application schema before the first DDL statement and the data
+ * of each table that a later DDL statement can destructively change. SQLite
+ * can transact DDL, but the DO protocol spans requests, so rollback needs an
+ * explicit durable image. The caller must wrap this in one storage transaction.
+ */
+export function snapshotTxSchema(
+  sql: DurableSqlStorage,
+  txID: string,
+  owner = 'default',
+  affectedTables: string[] = []
+): void {
+  sql.exec(TX_SCHEMA_DDL)
+  const exists = sql
+    .exec(
+      `SELECT 1 AS ok FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ? AND type = 'schema' LIMIT 1`,
+      txID
+    )
+    .toArray()
+  if (exists.length === 0) {
+    const objects = sql
+      .exec(
+        'SELECT type, name, tbl_name, sql FROM sqlite_master ' +
+          "WHERE type IN ('table', 'index', 'trigger', 'view') AND sql IS NOT NULL " +
+          'ORDER BY rowid'
+      )
+      .toArray()
+      .map((row) => ({
+        type: String(row.type ?? ''),
+        name: String(row.name ?? ''),
+        table: String(row.tbl_name ?? ''),
+        sql: String(row.sql ?? ''),
+      }))
+      .filter((row) => row.name && !isInternalObject(row.name))
+
+    // One JSON row per ~1MB of schema (see readSchemaSnapshot). The first
+    // chunk exists even for an empty schema, so a kill between CREATE TABLE
+    // and the client COMMIT/ROLLBACK still finds a recoverable snapshot, and
+    // it carries the cdc registrations (see snapshotCdcRegistrations for why
+    // registration reverts at the same whole-database scope as the triggers).
+    const chunkBytes = 1_000_000
+    const chunks: SchemaSnapshotObject[][] = []
+    let current: SchemaSnapshotObject[] = []
+    let size = 0
+    for (const object of objects) {
+      const objectSize = object.sql.length + object.name.length + object.table.length + 64
+      if (size + objectSize > chunkBytes && current.length > 0) {
+        chunks.push(current)
+        current = []
+        size = 0
+      }
+      current.push(object)
+      size += objectSize
+    }
+    chunks.push(current)
+    const cdc = readCdcRegistrations(sql)
+    for (const [index, chunk] of chunks.entries()) {
+      sql.exec(
+        `INSERT INTO "${TX_SCHEMA_TABLE}" (tx_id, owner, type, name, tbl_name, sql) VALUES (?, ?, 'schema', ?, '', ?)`,
+        txID,
+        owner,
+        String(index),
+        JSON.stringify(index === 0 ? { objects: chunk, cdc } : { objects: chunk })
+      )
+    }
+  }
+
+  for (const table of new Set(affectedTables)) {
+    if (!table || isInternalObject(table)) continue
+    const tableExists = sql
+      .exec(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        table
+      )
+      .toArray()
+    if (tableExists.length > 0) upgradeToTableSnapshot(sql, txID, table, owner)
+  }
+}
+
+/**
+ * Capture every cdc registration alongside the schema snapshot.
+ *
+ * A cdc trigger is restored by the schema snapshot -- it is not an internal
+ * object -- but the row in `_orez_cdc_tables` describing it IS internal and was
+ * never restored. The two halves reverted on different rules, so a rollback
+ * could leave a trigger with no registration. beginSchemaChange skips
+ * unregistered tables, so capture was never suspended and the next
+ * DROP/RENAME COLUMN on that table failed on the surviving trigger, forever
+ * (production, 2026-07-25).
+ *
+ * Scope matches the schema snapshot exactly, and that is the whole point. The
+ * snapshot is taken over ALL of sqlite_master, not over the statement's
+ * affected tables -- only the row-data snapshots are per-table -- so the
+ * restore drops any trigger absent from it, including one installed mid-session
+ * for a table this transaction never touched. Capturing per affected table
+ * instead would leave that table's row behind with its triggers gone: capture
+ * silently off on a table the system believes is captured. Registration
+ * therefore reverts wholesale, exactly as the triggers it describes do.
+ *
+ * Deliberately NOT extended to `_orez_cdc_buffer`, its sibling in
+ * INTERNAL_TABLES. The buffer is drained and cleared by every statement (see
+ * `drain`), so it holds in-flight changes rather than state describing a table;
+ * restoring it would re-emit change records for writes the rollback just undid.
+ */
+function readCdcRegistrations(sql: DurableSqlStorage): CdcRegistrationSnapshot[] {
+  const registrationTableExists = sql
+    .exec(
+      "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+      CDC_REGISTRATION_TABLE
+    )
+    .toArray()
+  if (registrationTableExists.length === 0) return []
+  return sql
+    .exec(
+      `SELECT physical_table, table_name, columns_json, publish, schema_version ` +
+        `FROM ${quoteIdent(CDC_REGISTRATION_TABLE)}`
+    )
+    .toArray()
+    .map((row) => ({
+      columns_json: String(row.columns_json ?? ''),
+      physical_table: String(row.physical_table ?? ''),
+      publish: Number(row.publish ?? 0),
+      schema_version: Number(row.schema_version ?? 0),
+      table_name: String(row.table_name ?? ''),
+    }))
+}
+
+/** persist one cheap recovery marker only when a transaction first mutates data. */
+export function beginTxJournal(
+  sql: DurableSqlStorage,
+  txID: string,
+  owner = 'default'
+): void {
+  sql.exec(TX_SCHEMA_DDL)
+  sql.exec(
+    `INSERT INTO "${TX_SCHEMA_TABLE}" (tx_id, owner, type, name, tbl_name, sql) ` +
+      `SELECT ?, ?, 'active', '', '', NULL WHERE NOT EXISTS (` +
+      `SELECT 1 FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ? AND type = 'active')`,
+    txID,
+    owner,
+    txID
+  )
+}
+
+function restoreSchemaSnapshot(
+  sql: DurableSqlStorage,
+  txID: string,
+  snapshot: ParsedSchemaSnapshot,
+  manifest: ManifestRow[]
+): void {
+  const current = sql
+    .exec(
+      'SELECT type, name, tbl_name, sql FROM sqlite_master ' +
+        "WHERE type IN ('table', 'index', 'trigger', 'view') AND sql IS NOT NULL " +
+        'ORDER BY rowid DESC'
+    )
+    .toArray()
+    .map((row) => ({
+      type: String(row.type ?? ''),
+      name: String(row.name ?? ''),
+      table: String(row.tbl_name ?? ''),
+      sql: String(row.sql ?? ''),
+    }))
+    .filter((row) => row.name && !isInternalObject(row.name))
+
+  const original = snapshot.objects.filter((row) => !isInternalObject(row.name))
+  const key = (row: { type: string; name: string }) => `${row.type}\0${row.name}`
+  const originalByKey = new Map(original.map((row) => [key(row), row]))
+  const currentByKey = new Map(current.map((row) => [key(row), row]))
+  const originalTables = original.filter((row) => row.type === 'table')
+  const currentTables = current.filter((row) => row.type === 'table')
+  const changedOriginalTables = new Set(
+    originalTables
+      .filter((row) => currentByKey.get(key(row))?.sql !== row.sql)
+      .map((row) => row.name)
+  )
+  const createdTables = new Set(
+    currentTables.filter((row) => !originalByKey.has(key(row))).map((row) => row.name)
+  )
+  const tablesToDrop = new Set([...changedOriginalTables, ...createdTables])
+  const snapshotByTable = new Map(
+    manifest.filter((row) => row.snapshot).map((row) => [row.original, row] as const)
+  )
+  for (const table of changedOriginalTables) {
+    if (!snapshotByTable.has(table)) {
+      throw new Error(`transactional DDL rollback is missing table snapshot: ${table}`)
+    }
+  }
+
+  // consumed on purpose: workerd executes a statement only as its cursor is
+  // read, so a discarded PRAGMA cursor silently never runs.
+  sql.exec('PRAGMA defer_foreign_keys = ON').toArray()
+  const changedCurrentObject = (object: (typeof current)[number]) => {
+    const before = originalByKey.get(key(object))
+    return !before || before.sql !== object.sql || tablesToDrop.has(object.table)
+  }
+  // Views can depend on tables. Indexes and triggers disappear with their
+  // table, while changed standalone objects are explicitly removed.
+  for (const object of current.filter(
+    (object) => object.type === 'view' && changedCurrentObject(object)
+  )) {
+    sql.exec(`DROP VIEW IF EXISTS ${quoteIdent(object.name)}`)
+  }
+  for (const object of current.filter(
+    (object) =>
+      object.type === 'trigger' &&
+      !tablesToDrop.has(object.table) &&
+      changedCurrentObject(object)
+  )) {
+    sql.exec(`DROP TRIGGER IF EXISTS ${quoteIdent(object.name)}`)
+  }
+  for (const object of current.filter(
+    (object) =>
+      object.type === 'index' &&
+      !tablesToDrop.has(object.table) &&
+      changedCurrentObject(object)
+  )) {
+    sql.exec(`DROP INDEX IF EXISTS ${quoteIdent(object.name)}`)
+  }
+  for (const table of tablesToDrop) sql.exec(`DROP TABLE IF EXISTS ${quoteIdent(table)}`)
+
+  const tables = originalTables.filter((row) => changedOriginalTables.has(row.name))
+  for (const row of tables) sql.exec(row.sql!)
+
+  const restores = tables.map((table) =>
+    prepareTableSnapshotRestore(sql, snapshotByTable.get(table.name)!)
+  )
+  for (const restore of restores) restoreTableSnapshot(sql, restore)
+
+  // Restore secondary objects only after all table rows are back. This keeps
+  // business triggers from firing while the snapshot data is inserted.
+  for (const type of ['index', 'trigger', 'view']) {
+    for (const row of original.filter((item) => item.type === type)) {
+      const after = currentByKey.get(key(row))
+      if (!after || after.sql !== row.sql || changedOriginalTables.has(row.table)) {
+        sql.exec(row.sql!)
+      }
+    }
+  }
+
+  // Revert cdc registration in lockstep with the triggers the restore above
+  // just put back or dropped, at the same whole-database scope the schema
+  // snapshot uses. Clearing first is what handles the other direction: a table
+  // registered during the transaction has had its triggers dropped by the
+  // restore, and a row left behind would claim a captured table that nothing
+  // captures. See `snapshotCdcRegistrations`.
+  if (
+    sql
+      .exec(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        CDC_REGISTRATION_TABLE
+      )
+      .toArray().length > 0
+  ) {
+    sql.exec(`DELETE FROM ${quoteIdent(CDC_REGISTRATION_TABLE)}`)
+    for (const registration of snapshot.cdc) {
+      sql.exec(
+        `INSERT INTO ${quoteIdent(CDC_REGISTRATION_TABLE)} ` +
+          '(physical_table, table_name, columns_json, publish, schema_version) VALUES (?, ?, ?, ?, ?)',
+        registration.physical_table,
+        registration.table_name,
+        registration.columns_json,
+        registration.publish,
+        registration.schema_version
+      )
+    }
+  }
+
+  // Consume only the snapshots used for schema restoration. Any remaining
+  // manifest entries belong to ordinary DML in the same transaction and must
+  // still run through the row/table rollback path below.
+  if (manifestTableExists(sql)) {
+    for (const table of changedOriginalTables) {
+      const snapshot = snapshotByTable.get(table)
+      if (snapshot) dropTable(sql, snapshot.snapshot!)
+      sql.exec(
+        `DELETE FROM "${TX_MANIFEST_TABLE}" WHERE tx_id = ? AND original = ?`,
+        txID,
+        table
+      )
+    }
+  }
+  sql.exec(`DELETE FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ?`, txID)
+  rollbackTxJournal(sql, txID)
+}
+
+/**
+ * commit a journaled transaction: drop its snapshot tables and delete its
+ * manifest rows. the data writes were applied eagerly during the tx, so once
+ * the manifest rows are gone the tx is durably committed. must run inside an
+ * atomic storage transaction.
+ */
+export function commitTxJournal(sql: DurableSqlStorage, txID: string): void {
+  if (manifestTableExists(sql)) {
+    for (const row of manifestRows(sql, txID)) {
+      if (row.snapshot) dropTable(sql, row.snapshot)
+    }
+    sql.exec(`DELETE FROM "${TX_MANIFEST_TABLE}" WHERE tx_id = ?`, txID)
+  }
+  if (schemaTableExists(sql)) {
+    sql.exec(`DELETE FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ?`, txID)
+  }
+}
+
+/**
+ * roll back a journaled transaction: restore every snapshotted table to its
+ * pre-tx contents (parents before children), drop tables that did not exist at
+ * first write (null snapshot), then clean up. triggers on restored tables are
+ * detached during the restore and re-created after, so restore DML doesn't
+ * re-fire change tracking. must run inside an atomic storage transaction.
+ */
+export function rollbackTxJournal(sql: DurableSqlStorage, txID: string): void {
+  const snapshot = readSchemaSnapshot(sql, txID)
+  const rows = manifestTableExists(sql) ? manifestRows(sql, txID).reverse() : []
+  if (snapshot.present) {
+    restoreSchemaSnapshot(sql, txID, snapshot, rows)
+    return
+  }
+  if (rows.length === 0) {
+    if (schemaTableExists(sql)) {
+      sql.exec(`DELETE FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ?`, txID)
+    }
+    return
+  }
+
+  // A snapshotted table can be gone by the time its row rollback runs: a schema
+  // restore in the same recovery drops created temp tables, and an earlier
+  // partial recovery may already have dropped one. Its rows cannot and need not
+  // be restored into a table that no longer exists — that restore is a no-op —
+  // but its snapshot table and manifest row must still be cleaned up below.
+  // Without this guard the DELETE/INSERT throws "no such table" and wedges the
+  // durable object on every wake (prod token-usage rebuild, 2026-07-22).
+  const allSnapshotRows = rows.filter(
+    (row) => row.snapshot !== null && row.snapshot !== ''
+  )
+  const restorableRows = allSnapshotRows.filter((row) => tableExists(sql, row.original))
+  const restores = new Map(
+    restorableRows.map((row) => [row.original, prepareTableSnapshotRestore(sql, row)])
+  )
+  const restoredTables = restorableRows.map((row) => row.original)
+  const triggers = suspendTriggers(sql, restoredTables)
+  // Defer constraint checks across the whole atomic restore. Delete every
+  // snapshotted table before inserting any snapshot rows: interleaving those
+  // phases lets a later DELETE in a cyclic cascade erase an earlier restore.
+  // consumed on purpose: see the identical note in restoreSchemaSnapshot.
+  sql.exec('PRAGMA defer_foreign_keys = ON').toArray()
+  const snapshotRows = parentFirst(sql, restorableRows)
+  for (const row of snapshotRows) {
+    sql.exec(`DELETE FROM ${quoteIdent(row.original)}`)
+  }
+  for (const row of snapshotRows) {
+    restoreTableSnapshot(sql, restores.get(row.original)!)
+  }
+  // Drop every snapshot table, including those whose original was gone: the
+  // snapshot is dead weight once the tx is being rolled back either way.
+  for (const row of allSnapshotRows) {
+    sql.exec(`DROP TABLE IF EXISTS ${quoteIdent(row.snapshot!)}`)
+  }
+  for (const row of rows) {
+    if (row.snapshot === null) {
+      sql.exec(`DROP TABLE IF EXISTS ${quoteIdent(row.original)}`)
+    }
+    // Empty-string snapshots are row-journaled tables. Their before-images
+    // were restored by the owner's CDC undo callback before this function.
+  }
+  restoreTriggers(sql, triggers)
+  sql.exec(`DELETE FROM "${TX_MANIFEST_TABLE}" WHERE tx_id = ?`, txID)
+  if (schemaTableExists(sql)) {
+    sql.exec(`DELETE FROM "${TX_SCHEMA_TABLE}" WHERE tx_id = ?`, txID)
+  }
+}
+
+/**
+ * Point a transaction's journal entry for `table` at a real table snapshot.
+ *
+ * The transaction owner marks a parsed write row-journaled (an empty snapshot) before the
+ * DO has said whether it can capture that table. When CDC declines it, because
+ * the table has no stable row identity, that empty marker promises a row-level
+ * rollback nothing is able to perform. The owner therefore copies the table and
+ * rewrites the marker in the same storage transaction as the write, which puts
+ * the transaction back on the snapshot path recovery already knows how to
+ * replay. Safe to call repeatedly: only the first write to a table in a
+ * transaction takes the copy.
+ */
+export function upgradeToTableSnapshot(
+  sql: DurableSqlStorage,
+  txID: string,
+  table: string,
+  owner = 'default'
+): void {
+  sql.exec(TX_MANIFEST_DDL)
+  const existing = sql
+    .exec(
+      `SELECT seq, snapshot FROM "${TX_MANIFEST_TABLE}" WHERE tx_id = ? AND original = ? ORDER BY seq`,
+      txID,
+      table
+    )
+    .toArray()
+  if (existing.length > 1)
+    throw new Error(`cannot snapshot duplicate manifest table: ${table}`)
+  // A snapshot is only a pre-transaction image if this transaction has not
+  // already written the table. Row-undo images prove it has: the copy would
+  // contain those writes, and `rollbackTxJournal` restores it AFTER row undo
+  // has removed them, so they would come back. Nothing here can reconstruct
+  // the pre-transaction contents, so refuse rather than corrupt the rollback.
+  if (existing.length === 0 && hasRowUndoImages(sql, txID, table)) {
+    throw new Error(
+      `cannot snapshot ${table} for transaction ${txID}: it already holds row-undo images from an earlier statement, so a first-touch snapshot would capture them`
+    )
+  }
+  // A null snapshot means the table did not exist at first write, so rollback
+  // drops it and no copy is needed. A non-empty one is already a real snapshot.
+  const snapshotted = existing.some(
+    (row) => row.snapshot === null || String(row.snapshot ?? '') !== ''
+  )
+  if (snapshotted) return
+
+  const identity = tableIdentity(sql, table)
+  if (
+    !identity ||
+    (!identity.withoutRowid && !identity.rowidColumn && !identity.rowidAlias)
+  ) {
+    throw new Error(`cannot snapshot inaccessible row identity: ${table}`)
+  }
+  const hidden =
+    !identity.withoutRowid && !identity.rowidColumn ? identity.rowidAlias : null
+  let sequence: false | null | string = false
+  if (identity.autoIncrement) {
+    const rows = sql
+      .exec(
+        'SELECT typeof(seq) AS kind, CAST(seq AS TEXT) AS value FROM sqlite_sequence WHERE name = ?',
+        table
+      )
+      .toArray()
+    if (
+      rows.length > 1 ||
+      (rows.length === 1 &&
+        (rows[0].kind !== 'integer' || typeof rows[0].value !== 'string'))
+    ) {
+      throw new Error(`cannot snapshot corrupt allocator state: ${table}`)
+    }
+    sequence = rows.length === 0 ? null : 'i' + rows[0].value
+  }
+
+  // Name the snapshot after the manifest row's seq, which is an AUTOINCREMENT
+  // primary key and therefore unique. Deriving the name from the table instead
+  // would have to sanitize it into an identifier, and that is not injective:
+  // `a-b` and `a_b` would collide on one snapshot table, so rolling the first
+  // one back would restore the other's rows and then drop the table the second
+  // still needs.
+  const seq =
+    existing.length > 0
+      ? Number(existing[0].seq)
+      : Number(
+          sql
+            .exec(
+              `INSERT INTO "${TX_MANIFEST_TABLE}" (tx_id, owner, original, snapshot) VALUES (?, ?, ?, '') RETURNING seq`,
+              txID,
+              owner,
+              table
+            )
+            .toArray()[0]?.seq
+        )
+  if (!Number.isSafeInteger(seq) || seq < 1)
+    throw new Error('transaction snapshot manifest sequence is invalid')
+  const snapshot = `_orez_tx_undo_v2_${seq}`
+  // populated manifests from older workers gain only an optional metadata
+  // column. old image names keep their explicit legacy restoration rules.
+  if (
+    !sql
+      .exec(`PRAGMA table_info("${TX_MANIFEST_TABLE}")`)
+      .toArray()
+      .some((row) => row.name === 'snapshot_state')
+  ) {
+    sql.exec(`ALTER TABLE "${TX_MANIFEST_TABLE}" ADD COLUMN snapshot_state TEXT`)
+  }
+  sql.exec(
+    `CREATE TABLE ${quoteIdent(snapshot)} AS SELECT ${hidden ? quoteIdent(hidden) + ' AS ' + quoteIdent(hidden) + ', ' : ''}* FROM ${quoteIdent(table)}`
+  )
+  sql.exec(
+    `UPDATE "${TX_MANIFEST_TABLE}" SET snapshot = ?, snapshot_state = ? WHERE seq = ?`,
+    snapshot,
+    JSON.stringify({ version: 2, table, rowid: hidden, sequence }),
+    seq
+  )
+}
+
+const TRIGGER_WRITE =
+  /\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE(?:\s+OR\s+\w+)?\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+(?:"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|\[([^\]]+)\]|([A-Za-z_][\w$]*))(?:\s*\.\s*(?:"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|\[([^\]]+)\]|([A-Za-z_][\w$]*)))?/i
+
+function triggerWriteTargets(sql: string | null): string[] | null {
+  if (!sql) return null
+  const begin = sql.search(/\bBEGIN\b/i)
+  const end = sql.search(/\bEND\s*$/i)
+  if (begin < 0 || end < begin) return null
+  const targets: string[] = []
+  for (const statement of sql.slice(begin + 5, end).split(';')) {
+    if (!/\b(?:INSERT|REPLACE|UPDATE|DELETE)\b/i.test(statement)) continue
+    const match = TRIGGER_WRITE.exec(statement)
+    if (!match) return null
+    const target =
+      match[5] ??
+      match[6] ??
+      match[7] ??
+      match[8] ??
+      match[1] ??
+      match[2] ??
+      match[3] ??
+      match[4]
+    if (!target) return null
+    targets.push(target.replaceAll('""', '"').replaceAll('``', '`'))
+  }
+  return targets
+}
+
+// sqlite's built-in identifier comparison folds ASCII case only.
+function sqliteNoCase(identifier: string): string {
+  return identifier.replace(/[A-Z]/g, (character) => character.toLowerCase())
+}
+
+/** The operation a tracked statement performs on its own table. */
+export type TrackedOperation = 'INSERT' | 'UPDATE' | 'DELETE' | 'UPSERT'
+
+/** What SQLite can implicitly do to a table reached through a referential action or trigger. */
+type RowOperation = 'INSERT' | 'UPDATE' | 'DELETE'
+
+const ROW_OPERATIONS: readonly RowOperation[] = ['INSERT', 'UPDATE', 'DELETE']
+
+// The event keyword sits immediately before `ON <table>`, or before `OF
+// <columns>` for a column-scoped UPDATE trigger. Anchoring on that separator
+// distinguishes the event from a trigger *named* insert/update/delete.
+const TRIGGER_EVENT = /\b(DELETE|INSERT|UPDATE)\s+(?:OF\b|ON\b)/i
+
+function triggerEvent(sql: string | null): RowOperation | null {
+  if (!sql) return null
+  const begin = sql.search(/\bBEGIN\b/i)
+  const match = TRIGGER_EVENT.exec(begin < 0 ? sql : sql.slice(0, begin))
+  return match ? (match[1]!.toUpperCase() as RowOperation) : null
+}
+
+const NO_SNAPSHOTS: ReadonlySet<string> = new Set<string>()
+
+/** true when this transaction already recorded row-undo images for `table`. */
+function hasRowUndoImages(sql: DurableSqlStorage, txID: string, table: string): boolean {
+  if (!tableExists(sql, PENDING_CHANGES_TABLE)) return false
+  return (
+    sql
+      .exec(
+        `SELECT 1 AS ok FROM ${quoteIdent(PENDING_CHANGES_TABLE)} ` +
+          'WHERE transaction_id = ? AND physical_table_name = ? AND undoable != 0 LIMIT 1',
+        txID,
+        table
+      )
+      .toArray().length > 0
+  )
+}
+
+/**
+ * snapshot the source table and the transitive targets of its business
+ * triggers and cascading/SET foreign keys. trigger SQL and FK metadata name
+ * every table SQLite can mutate implicitly, so copying unrelated published
+ * tables only multiplies billable writes during zero-cache startup. if a
+ * reachable trigger cannot be understood, retain the conservative all-table
+ * fallback.
+ *
+ * reachability is per (table, operation), because SQLite fires implicit writes
+ * per operation: `ON DELETE CASCADE` only fires when the parent row is deleted,
+ * and `AFTER DELETE` triggers only fire on a delete. discovering side effects
+ * from the table alone made every UPDATE pay for its children's delete
+ * cascades. soot's five-second `sootAgent.runtimeClaimExpiresAt` renewal copied
+ * the whole `agentEvent` table on each beat purely because `agentEvent`
+ * references `sootAgent` `ON DELETE CASCADE`: 35 billable rows with an empty
+ * event table, 1,035 with 1,000 retained events, and the rolling write budget
+ * tripped from heartbeats alone once the table grew.
+ *
+ * returns the tables it actually snapshotted, which is the reachable set minus
+ * everything `coversRowUndo` can roll back row by row. the caller marks each
+ * captured change undoable against that set, so a statement that snapshots one
+ * uncoverable side-effect target does not also strand its coverable tables with
+ * a rollback nothing performs.
+ *
+ * this filter is also what keeps a snapshot from ever being taken late.
+ * before the boot cleanup removed them, the retired zero-http engine's
+ * `_zsync_tr_*` triggers made every synced write reach `_zsync_changes` and so
+ * copy both the journal AND the written table on every transaction: 2,854 rows
+ * per write on one measured namespace, against a 300,000-row budget, which
+ * froze three production apps. those tables are row-undoable, so none of that
+ * copying was buying anything.
+ */
+export function snapshotSideEffectWriteTables(
+  sql: DurableSqlStorage,
+  txID: string,
+  sourceTable: string,
+  operation: TrackedOperation,
+  coversRowUndo: (physicalTable: string) => boolean
+): ReadonlySet<string> {
+  const relations = sql
+    .exec(
+      "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') " +
+        "AND name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' AND name NOT GLOB '_orez_bk_*' ORDER BY name"
+    )
+    .toArray()
+    .map((row) => ({ name: String(row.name ?? ''), type: String(row.type ?? '') }))
+    .filter((relation) => relation.name)
+  const knownRelations = new Set(relations.map((relation) => sqliteNoCase(relation.name)))
+  const snapshotTables = new Map(
+    relations
+      .filter(
+        (relation) =>
+          relation.type === 'table' &&
+          !relation.name.startsWith('_orez_') &&
+          !relation.name.startsWith('_zero_')
+      )
+      .map((relation) => [sqliteNoCase(relation.name), relation.name])
+  )
+  const node = (table: string, op: RowOperation) => `${sqliteNoCase(table)}\0${op}`
+  const edges = new Map<string, Set<string>>()
+  const unsafeNodes = new Set<string>()
+  // Nodes reached by a referential action rather than by a trigger. Rollback
+  // suspends triggers over the tables it touches, so a trigger's target can be
+  // undone row by row without the trigger firing again. A foreign key is a
+  // constraint, not a trigger, and nothing suspends it: undoing the parent
+  // re-fires the action against the child, which then no longer matches its own
+  // before-image. Such a child must keep its table snapshot.
+  const referentialNodes = new Set<string>()
+  const addEdge = (
+    from: string,
+    fromOp: RowOperation,
+    to: string,
+    toOps: readonly RowOperation[],
+    referential = false
+  ) => {
+    const fromKey = node(from, fromOp)
+    const targets = edges.get(fromKey) ?? new Set<string>()
+    for (const toOp of toOps) {
+      const toKey = node(to, toOp)
+      targets.add(toKey)
+      if (referential) referentialNodes.add(toKey)
+    }
+    edges.set(fromKey, targets)
+  }
+
+  const triggers = sql
+    .exec(
+      "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' " +
+        "AND name NOT GLOB '_orez_cdc_*'"
+    )
+    .toArray()
+  for (const row of triggers) {
+    const from = String(row.tbl_name ?? '')
+    const definition = row.sql === null || row.sql === undefined ? null : String(row.sql)
+    // an unreadable header hides which operation fires the trigger, so every
+    // operation on its table has to assume it does.
+    const event = triggerEvent(definition)
+    const firedBy = event ? [event] : ROW_OPERATIONS
+    const targets = triggerWriteTargets(definition)
+    const unknownTarget =
+      !targets || targets.some((target) => !knownRelations.has(sqliteNoCase(target)))
+    for (const firing of firedBy) {
+      if (unknownTarget) {
+        unsafeNodes.add(node(from, firing))
+        continue
+      }
+      // reading which operation a trigger body performs would have to model
+      // REPLACE conflict resolution deleting rows, so assume all three on the
+      // target. only whether the trigger fires at all is decided precisely.
+      for (const target of targets!) addEdge(from, firing, target, ROW_OPERATIONS)
+    }
+  }
+
+  for (const child of relations) {
+    if (child.type !== 'table') continue
+    for (const row of sql
+      .exec(`PRAGMA foreign_key_list(${quoteIdent(child.name)})`)
+      .toArray()) {
+      const parent = String(row.table ?? '')
+      if (!parent) continue
+      const onDelete = String(row.on_delete ?? 'NO ACTION').toUpperCase()
+      const onUpdate = String(row.on_update ?? 'NO ACTION').toUpperCase()
+      // deleting a parent row deletes cascaded children and rewrites SET ones.
+      if (onDelete === 'CASCADE') addEdge(parent, 'DELETE', child.name, ['DELETE'], true)
+      else if (onDelete === 'SET NULL' || onDelete === 'SET DEFAULT')
+        addEdge(parent, 'DELETE', child.name, ['UPDATE'], true)
+      // updating a parent key rewrites children under every non-restricting
+      // action. which columns the statement touched is not known here, so any
+      // parent update follows the ON UPDATE edge.
+      if (onUpdate === 'CASCADE' || onUpdate === 'SET NULL' || onUpdate === 'SET DEFAULT')
+        addEdge(parent, 'UPDATE', child.name, ['UPDATE'], true)
+    }
+  }
+
+  // an upsert resolves to an insert or an update and only SQLite knows which,
+  // so it seeds both. an insert fires no referential action.
+  const seeded: readonly RowOperation[] =
+    operation === 'UPSERT' ? ['INSERT', 'UPDATE'] : [operation]
+  const reachable = new Set<string>()
+  const reachableTables = new Set<string>()
+  const referentialTables = new Set<string>()
+  const pending = seeded.map((op) => node(sourceTable, op))
+  let hasSideEffect = false
+  let mustSnapshotAll = false
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    if (reachable.has(current)) continue
+    reachable.add(current)
+    reachableTables.add(current.slice(0, current.indexOf('\0')))
+    if (referentialNodes.has(current))
+      referentialTables.add(current.slice(0, current.indexOf('\0')))
+    if (unsafeNodes.has(current)) mustSnapshotAll = true
+    for (const target of edges.get(current) ?? []) {
+      hasSideEffect = true
+      pending.push(target)
+    }
+  }
+  if (!hasSideEffect && !mustSnapshotAll) return NO_SNAPSHOTS
+
+  const candidates = mustSnapshotAll
+    ? [...snapshotTables.values()]
+    : [...reachableTables]
+        .map((table) => snapshotTables.get(table))
+        .filter((table): table is string => table !== undefined)
+
+  const snapshotted = new Set<string>()
+  for (const table of candidates.sort()) {
+    // Copy only what CDC cannot undo row by row. Row-level undo is both cheaper
+    // and the only form of rollback that cannot be captured at the wrong
+    // moment: `upgradeToTableSnapshot` copies at first TOUCH, so a table this
+    // statement skipped and a later statement copies would be captured with
+    // this statement's writes already committed into it, and the restore would
+    // put them back after row undo had removed them.
+    if (coversRowUndo(table) && !referentialTables.has(sqliteNoCase(table))) continue
+    // `upgradeToTableSnapshot` refuses a table this transaction has already
+    // written row-undoably, which is what stops a late first-touch copy.
+    upgradeToTableSnapshot(sql, txID, table)
+    snapshotted.add(table)
+  }
+  return snapshotted
+}
+
+/**
+ * roll back every journaled transaction belonging to `owner` (or every
+ * transaction when owner is undefined), and sweep `_orez_tx_*` snapshot
+ * tables no manifest row references (leftovers from pre-journal code).
+ *
+ * callers must guarantee none of the matched transactions can still be live
+ * — i.e. the owning process generation is dead (embed boot before opening pg
+ * sessions, or a store whose only client lives in the same isolate).
+ *
+ * returns the recovered transaction ids so callers can clean up associated
+ * state (e.g. pending tracked changes).
+ */
+export function recoverTxJournal(
+  sql: DurableSqlStorage,
+  owner?: string,
+  beforeRollback?: (txID: string) => void
+): string[] {
+  const recovered: string[] = []
+  const transactionIDs = new Set<string>()
+  for (const table of [TX_MANIFEST_TABLE, TX_SCHEMA_TABLE]) {
+    const exists =
+      table === TX_MANIFEST_TABLE ? manifestTableExists(sql) : schemaTableExists(sql)
+    if (!exists) continue
+    const txRows =
+      owner === undefined
+        ? sql.exec(`SELECT DISTINCT tx_id FROM ${quoteIdent(table)}`).toArray()
+        : sql
+            .exec(
+              `SELECT DISTINCT tx_id FROM ${quoteIdent(table)} WHERE owner = ?`,
+              owner
+            )
+            .toArray()
+    for (const row of txRows) transactionIDs.add(String(row.tx_id))
+  }
+  for (const txID of transactionIDs) {
+    beforeRollback?.(txID)
+    rollbackTxJournal(sql, txID)
+    recovered.push(txID)
+  }
+
+  // sweep snapshot tables nothing references: pre-journal leftovers from a
+  // killed tx. live transactions (any owner) are protected by their manifest
+  // rows, which are created atomically with the snapshot table.
+  const referenced = new Set(
+    manifestTableExists(sql)
+      ? sql
+          .exec(`SELECT snapshot FROM "${TX_MANIFEST_TABLE}" WHERE snapshot IS NOT NULL`)
+          .toArray()
+          .map((row) => String(row.snapshot))
+      : []
+  )
+  const orphanTables = sql
+    .exec(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '\\_orez\\_tx\\_%' ESCAPE '\\' AND name != ?",
+      TX_MANIFEST_TABLE
+    )
+    .toArray()
+    .map((row) => String(row.name))
+    .filter((name) => name !== TX_SCHEMA_TABLE && !referenced.has(name))
+  for (const name of orphanTables) dropTable(sql, name)
+
+  return recovered
+}

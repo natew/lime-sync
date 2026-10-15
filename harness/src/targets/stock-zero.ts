@@ -1,0 +1,287 @@
+// stock-zero target: real embedded postgres (wal_level=logical) + real
+// zero-cache spawned from node_modules. this is the reference implementation
+// every other target's behavior is compared against.
+import { type ChildProcess, spawn } from 'node:child_process'
+import { existsSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+
+import { Zero } from '@rocicorp/zero'
+import postgres from 'postgres'
+
+import { findPortBlock } from '../../../src/port.js'
+import { startAppServer } from '../app-server.js'
+import { DDL, SEED, jsonColumns, mutators, permissions, schema } from '../fixture.js'
+
+import type { Rows, SyncTarget } from '../target.js'
+
+// derive every install-name a bundled darwin dylib might be referenced by:
+// lib<name>.<v1>.<v2>...<vk>.dylib -> lib<name>.dylib, lib<name>.<v1>.dylib,
+// ..., lib<name>.<v1>...<v(k-1)>.dylib (every prefix truncation except the full
+// file). the vendored binaries link a MIX of the unversioned name
+// (libicui18n.dylib) and the major soname (libzstd.1.dylib), so create both.
+// files with a single version component (libpq.5.dylib) yield the unversioned
+// link; already-unversioned files (libfoo.dylib) yield none.
+function darwinSonames(file: string): string[] {
+  if (!file.endsWith('.dylib')) return []
+  const parts = file.slice(0, -'.dylib'.length).split('.')
+  const firstNum = parts.findIndex((p) => /^\d+$/.test(p))
+  if (firstNum <= 0) return []
+  const versions = parts.slice(firstNum)
+  if (!versions.every((v) => /^\d+$/.test(v))) return []
+  const base = parts.slice(0, firstNum).join('.')
+  return versions.map((_, k) => `${[base, ...versions.slice(0, k)].join('.')}.dylib`)
+}
+
+const require = createRequire(import.meta.url)
+
+// crib of orez src/native-postgres.ts SERVER_FLAGS: logical replication for
+// zero's change source, loopback only, fast commits for a throwaway store
+const PG_FLAGS = [
+  '-c',
+  'wal_level=logical',
+  '-c',
+  'listen_addresses=127.0.0.1',
+  '-c',
+  'synchronous_commit=off',
+  '-c',
+  'unix_socket_directories=',
+]
+
+// zero-cache's global-tables bootstrap (deploy-permissions does exactly this
+// before writing the permissions row; replicated here so we skip the CLI's
+// typescript loader). appID default is 'zero'.
+function globalSetupSql(app: string) {
+  return `
+  CREATE SCHEMA IF NOT EXISTS ${app};
+  CREATE TABLE IF NOT EXISTS ${app}.permissions (
+    "permissions" JSONB,
+    "hash"        TEXT,
+    "lock" BOOL PRIMARY KEY DEFAULT true CHECK (lock)
+  );
+  CREATE OR REPLACE FUNCTION ${app}.set_permissions_hash()
+  RETURNS TRIGGER AS $$
+  BEGIN
+      NEW.hash = md5(NEW.permissions::text);
+      RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+  CREATE OR REPLACE TRIGGER on_set_permissions
+    BEFORE INSERT OR UPDATE ON ${app}.permissions
+    FOR EACH ROW
+    EXECUTE FUNCTION ${app}.set_permissions_hash();
+  INSERT INTO ${app}.permissions (permissions) VALUES (NULL) ON CONFLICT DO NOTHING;
+`
+}
+
+async function waitForHttp(url: string, timeoutMs: number) {
+  const start = Date.now()
+  let lastError: unknown
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await fetch(url)
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((r) => setTimeout(r, 200))
+    }
+  }
+  throw new Error(`timed out waiting for ${url}: ${lastError}`)
+}
+
+export async function startStockZero(opts?: {
+  pgPort?: number
+  zeroPort?: number
+  appPort?: number
+  logLevel?: string
+}): Promise<SyncTarget> {
+  // stay below linux's ephemeral client-port range: zero-cache binds late in
+  // boot, after postgres setup has opened connections that can otherwise
+  // claim its listener port. zero-cache also binds ZERO_PORT+1 and +2.
+  const base = await findPortBlock(20_000 + Math.floor(Math.random() * 300) * 16, 13, {
+    host: '::',
+  })
+  const pgPort = opts?.pgPort ?? base
+  const zeroPort = opts?.zeroPort ?? base + 4
+  const appPort = opts?.appPort ?? base + 12
+  const dataDir = mkdtempSync(join(tmpdir(), 'zharness-stock-'))
+
+  // npm packages cannot contain symlinks, so @embedded-postgres/<platform>
+  // ships only fully-versioned libs while initdb's loader wants the bare
+  // soname. on any host without the system libs (ubuntu-latest CI; a mac with
+  // no homebrew icu/zstd) initdb dies at load. recreate the missing soname
+  // links next to the bundled libs before booting.
+  //   linux:  libicuuc.so.60.2       -> loader wants libicuuc.so.60
+  //   darwin: libicudata.68.2.dylib  -> loader wants libicudata.68.dylib
+  //           libzstd.1.5.6.dylib    -> loader wants libzstd.1.dylib
+  // darwin binaries here reference a MIX of install names: some fully
+  // versioned (libzstd.1.dylib), some unversioned (libicui18n.dylib). so for a
+  // real file lib<name>.<v1>.<v2>...<vk>.dylib create every prefix truncation
+  // (lib<name>.dylib, lib<name>.v1.dylib, ...) that is missing. linux keeps the
+  // narrower soname (lib<name>.so.<major>) the existing CI relies on.
+  const sonameCandidates =
+    process.platform === 'linux'
+      ? {
+          dir: `linux-${process.arch}`,
+          names: (f: string) =>
+            f.match(/^(.+\.so\.\d+)\.[\d.]+$/)?.[1]
+              ? [f.match(/^(.+\.so\.\d+)\.[\d.]+$/)![1]]
+              : [],
+        }
+      : process.platform === 'darwin'
+        ? { dir: `darwin-${process.arch}`, names: darwinSonames }
+        : undefined
+  if (sonameCandidates) {
+    const resolved = require.resolve('embedded-postgres')
+    const nodeModules = resolved.slice(
+      0,
+      resolved.lastIndexOf('node_modules') + 'node_modules'.length
+    )
+    const libDir = join(
+      nodeModules,
+      '@embedded-postgres',
+      sonameCandidates.dir,
+      'native',
+      'lib'
+    )
+    if (existsSync(libDir)) {
+      for (const file of readdirSync(libDir)) {
+        for (const soname of sonameCandidates.names(file)) {
+          if (soname !== file && !existsSync(join(libDir, soname))) {
+            symlinkSync(file, join(libDir, soname))
+          }
+        }
+      }
+    }
+  }
+
+  // embedded-postgres default export is the class
+  const { default: EmbeddedPostgres } = await import('embedded-postgres')
+  const pg = new EmbeddedPostgres({
+    databaseDir: join(dataDir, 'pg'),
+    user: 'postgres',
+    password: 'password',
+    port: pgPort,
+    persistent: false,
+    postgresFlags: PG_FLAGS,
+  })
+  await pg.initialise()
+  await pg.start()
+  await pg.createDatabase('zharness')
+
+  const dbUrl = `postgres://postgres:password@127.0.0.1:${pgPort}/zharness`
+  const sql = postgres(dbUrl, { max: 4, onnotice: () => {} })
+
+  for (const stmt of DDL) await sql.unsafe(stmt)
+  for (const [tableName, rows] of Object.entries(SEED)) {
+    const jsonCols = jsonColumns(tableName)
+    for (const row of rows) {
+      // schema-driven json encoding: sql.json makes pg store the intended
+      // json VALUE. a plain string param into jsonb double-encodes (stores a
+      // json string) — the shapes lane caught exactly that.
+      const insert = Object.fromEntries(
+        Object.entries(row).map(([k, v]) => [
+          k,
+          jsonCols.has(k) && v !== null ? sql.json(v as never) : v,
+        ])
+      )
+      await sql`INSERT INTO ${sql(tableName)} ${sql(insert)}`
+    }
+  }
+
+  // deploy ANYONE_CAN_DO_ANYTHING permissions the way zero-deploy-permissions does
+  await sql.unsafe(globalSetupSql('zero'))
+  const perms = await permissions
+  await sql`UPDATE zero.permissions SET permissions = ${sql.json(perms as never)}`
+
+  // the fixture app server: named-query transform + custom-mutator execution
+  const app = await startAppServer({ dbUrl, port: appPort })
+
+  // spawn real zero-cache from node_modules
+  const zeroEntry = require.resolve('@rocicorp/zero')
+  const cli = resolve(zeroEntry, '../../..', 'zero/src/cli.js')
+  const replicaFile = join(dataDir, 'replica.db')
+  // 'node' from PATH, NOT process.execPath: under bun that is the bun binary,
+  // and zero-cache (multi-process node server) does not boot under bun
+  const child: ChildProcess = spawn('node', [cli], {
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      ZERO_UPSTREAM_DB: dbUrl,
+      ZERO_CVR_DB: dbUrl,
+      ZERO_CHANGE_DB: dbUrl,
+      ZERO_REPLICA_FILE: replicaFile,
+      ZERO_PORT: String(zeroPort),
+      ZERO_LOG_LEVEL: opts?.logLevel ?? 'warn',
+      ZERO_NUM_SYNC_WORKERS: '1',
+      // pin the task id: when unset, zero-cache 1.7.0 generates a nanoid and
+      // re-exports it to child workers via ZERO_TASK_ID; a nanoid starting
+      // with '-' followed by letters is mis-parsed by the env->argv config
+      // round-trip as an option token, leaving --task-id valueless (boolean
+      // true) and crashing the worker at boot with "Expected string at
+      // taskID. Got true" (~0.03% of boots, an intermittent CI failure)
+      ZERO_TASK_ID: `zharness-stock-${zeroPort}`,
+      OTEL_SDK_DISABLED: 'true',
+      // modern surface only: custom mutators + named queries through the app
+      // server; setting both URLs also enables them without JWT config. CRUD
+      // is disabled so nothing can silently fall back to the legacy path.
+      ZERO_MUTATE_URL: `${app.url}/mutate`,
+      ZERO_QUERY_URL: `${app.url}/query`,
+      ZERO_ENABLE_CRUD_MUTATIONS: 'false',
+    },
+    stdio: ['ignore', 'inherit', 'inherit'],
+  })
+  const childExit = new Promise<number | null>((res) => child.on('exit', res))
+  childExit.then((code) => {
+    if (code !== null && code !== 0)
+      console.error(`[stock-zero] zero-cache exited ${code}`)
+  })
+
+  await waitForHttp(`http://127.0.0.1:${zeroPort}/`, 60_000)
+
+  const clients: Zero<typeof schema>[] = []
+  let clientN = 0
+
+  return {
+    name: 'stock-zero',
+
+    createClient(userID: string, storage) {
+      const zero = new Zero({
+        server: `http://127.0.0.1:${zeroPort}`,
+        userID,
+        auth: `token-${userID}`,
+        schema,
+        mutators,
+        kvStore: storage?.kvStore ?? ('mem' as const),
+        onClientStateNotFound: storage?.onClientStateNotFound,
+        storageKey: storage?.storageKey ?? `zharness-${++clientN}`,
+      })
+      clients.push(zero)
+      return zero
+    },
+
+    async sql(query: string): Promise<Rows> {
+      return (await sql.unsafe(query)) as unknown as Rows
+    },
+
+    async oracle(query: string): Promise<Rows> {
+      return (await sql.unsafe(query)) as unknown as Rows
+    },
+
+    async metrics() {
+      return {}
+    },
+
+    async close() {
+      while (clients.length) await clients.pop()?.close()
+      child.kill('SIGTERM')
+      await Promise.race([childExit, new Promise((r) => setTimeout(r, 5_000))])
+      if (child.exitCode === null) child.kill('SIGKILL')
+      await app.close()
+      await sql.end({ timeout: 2 })
+      await pg.stop()
+      rmSync(dataDir, { recursive: true, force: true })
+    },
+  }
+}

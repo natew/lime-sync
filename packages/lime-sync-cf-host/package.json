@@ -1,0 +1,91 @@
+{
+  "name": "lime-sync-cf-host",
+  "version": "0.16.20",
+  "description": "Internal orez Cloudflare sync host. Do not import directly: consumers use lime-sync/cloudflare/sync.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node-wasm-loader": {
+      "types": "./dist/node-wasm-loader.d.ts",
+      "import": "./dist/node-wasm-loader.js"
+    },
+    "./bun-wasm-loader": {
+      "types": "./dist/bun-wasm-loader.d.ts",
+      "import": "./dist/bun-wasm-loader.js"
+    },
+    "./query-compiler": {
+      "types": "./dist/query-compiler.d.ts",
+      "import": "./dist/query-compiler.js"
+    },
+    "./query-patch": {
+      "types": "./dist/query-patch.d.ts",
+      "import": "./dist/query-patch.js"
+    },
+    "./transaction-query": {
+      "types": "./dist/transaction-query.d.ts",
+      "import": "./dist/transaction-query.js"
+    },
+    "./vite-wasm-loader": {
+      "types": "./dist/vite-wasm-loader.d.ts",
+      "import": "./dist/vite-wasm-loader.js"
+    },
+    "./wasm-module.wasm": {
+      "types": "./dist/generated/sync_wasm_bg.wasm.d.ts",
+      "import": "./dist/generated/sync_wasm_bg.wasm",
+      "default": "./dist/generated/sync_wasm_bg.wasm"
+    }
+  },
+  "scripts": {
+    "build:dependencies": "bun run --cwd ../lime-sync-executor build",
+    "build:wasm": "wasm-pack build ../../crates/sync-wasm --target web --release --out-dir ../../packages/lime-sync-cf-host/src/generated --out-name sync_wasm && rm -f src/generated/.gitignore && bun scripts/finish-wasm-build.ts",
+    "build:wasm:platform": "wasm-pack build ../../crates/sync-wasm --target web --release --out-dir ../../packages/lime-sync-cf-host/src/generated --out-name sync_wasm -- --features platform-probes && rm -f src/generated/.gitignore && bun scripts/finish-wasm-build.ts --platform-probes",
+    "build:runtime": "rm -rf dist && mkdir -p dist && cp -R src/generated dist/generated && tsc -p tsconfig.build.json",
+    "build:dist": "bun run build:dependencies && bun run build:wasm && bun run build:runtime",
+    "build:dist:platform": "bun run build:dependencies && bun run build:wasm:platform && bun run build:runtime",
+    "bundle": "bun run build:dist && wrangler deploy --dry-run --outdir .wrangler/bundle",
+    "measure": "bun run build:dist && bun measure.mjs",
+    "test": "bun run test:config && bun run test:query-compiler && bun run test:package && bun run test:platform && bun run test:integration && bun run test:large-data && bun run test:ingest && bun run test:restart",
+    "test:config": "bun test config.test.mjs query-patch.test.mjs write-safeguards.test.mjs transaction-query.test.mjs upstream-response.test.mjs serving-lag.test.mjs",
+    "test:integration": "bun run build:dist && bun integration-test.mjs",
+    "test:ingest": "bun run build:dist && bun ingest-test.mjs",
+    "test:package": "bun run build:dist && node package-runtime-test.mjs",
+    "test:query-compiler": "bun run build:dist && bun test --preload lime-sync-cf-host/bun-wasm-loader query-compiler.test.mjs && node vite-ssr-query-compiler-test.mjs",
+    "test:restart": "bun run build:dist && bun restart-test.mjs",
+    "test:platform": "bun run build:dist:platform && bun platform-test.mjs",
+    "typecheck": "bun run build:dist:platform && tsc --noEmit",
+    "test:large-data": "bun run build:dist && bun large-data-test.mjs"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "lime-sync-executor": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260617.1",
+    "@types/bun": "1.3.14",
+    "@types/node": "22.19.10",
+    "typescript": "5.9.3",
+    "workerd": "1.20260617.1",
+    "wrangler": "4.103.0"
+  },
+  "peerDependencies": {
+    "@rocicorp/zero": ">=1.7.0",
+    "vite": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natew/lime-sync.git",
+    "directory": "packages/lime-sync-cf-host"
+  }
+}

@@ -1,0 +1,13 @@
+diff --git a/crates/sync-core/src/store.rs b/crates/sync-core/src/store.rs
+--- a/crates/sync-core/src/store.rs
++++ b/crates/sync-core/src/store.rs
+@@ -43,7 +43,8 @@ pub(crate) fn watermark(db: &mut dyn SyncDb) -> Result<i64, EngineError> {
+         &[],
+     )?;
+     let segment = ledger::watermark(db)?;
+-    Ok(high.max(segment))
++    let _ = high;
++    Ok(segment)
+ }
+ 
+ pub(crate) fn floor(db: &mut dyn SyncDb) -> Result<i64, EngineError> {

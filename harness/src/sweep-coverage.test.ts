@@ -1,0 +1,118 @@
+import { describe, expect, test } from 'bun:test'
+
+import {
+  isSuppressedNullBoundLimitVsStock,
+  SWEEP_COVERAGE_AXES,
+  sweepAxisAssignment,
+  sweepPairwiseCoverage,
+} from './sweep-coverage.js'
+
+import type { GenSpec, GenSubSpec } from './fixture.js'
+
+describe('sweep pairwise coverage', () => {
+  test('classifies every grammar axis', () => {
+    const spec: GenSpec = {
+      table: 'task',
+      where: {
+        op: 'and',
+        children: [
+          { op: 'cmp', col: 'done', cmp: '=', value: true },
+          { op: 'cmp', col: 'rank', cmp: '>', value: 1 },
+        ],
+      },
+      exists: [
+        { rel: 'project', where: { op: 'cmp', col: 'id', cmp: '=', value: 'p0' } },
+      ],
+      orderBy: [
+        ['rank', 'desc'],
+        ['id', 'asc'],
+      ],
+      start: { row: { rank: 1, id: 't0' }, inclusive: true },
+      limit: 3,
+      related: [
+        {
+          rel: 'project',
+          sub: { related: [{ rel: 'members' }] },
+        },
+      ],
+    }
+
+    expect(sweepAxisAssignment(spec)).toEqual({
+      table: 'task',
+      filter: 'boolean',
+      exists: 'filtered',
+      order: 'cursor',
+      limit: 'set',
+      start: 'inclusive',
+      cursorValue: 'number',
+      related: 'nested',
+      cardinality: 'many',
+    })
+  })
+
+  test('reports a constrained denominator and deterministic missing tuples', () => {
+    const bare: GenSpec = { table: 'user', orderBy: [['id', 'asc']] }
+    const report = sweepPairwiseCoverage([bare])
+
+    expect(SWEEP_COVERAGE_AXES).toHaveLength(9)
+    expect(report.hit).toBe(36) // C(9, 2): one tuple hit per axis pair
+    // 280 with the null cursorValue pairs; 263 while
+    // SUPPRESS_NULL_START_VS_STOCK marks them unreachable (stock pin cannot
+    // serve null-anchored cursors — restore 280 when the pin advances)
+    expect(report.total).toBe(263)
+    expect(report.percent).toBeGreaterThan(0)
+    expect(report.percent).toBeLessThan(100)
+    expect(report.missing).toEqual([...report.missing].sort())
+    expect(report.byAxisPair).toHaveLength(36)
+  })
+
+  test('classifies nullable start cursors as their own axis', () => {
+    const nullable: GenSpec = {
+      table: 'task',
+      orderBy: [
+        ['dueAt', 'asc'],
+        ['id', 'asc'],
+      ],
+      start: { row: { dueAt: null, id: 't1' } },
+    }
+    expect(sweepAxisAssignment(nullable).cursorValue).toBe('null')
+  })
+
+  test('suppresses only nullable ascending task limits against the stock pin', () => {
+    const dueAtAsc = {
+      orderBy: [
+        ['dueAt', 'asc'],
+        ['id', 'asc'],
+      ],
+      limit: 4,
+    } satisfies GenSubSpec
+
+    expect(isSuppressedNullBoundLimitVsStock('task', dueAtAsc)).toBe(true)
+    expect(
+      isSuppressedNullBoundLimitVsStock('task', {
+        ...dueAtAsc,
+        orderBy: [
+          ['dueAt', 'desc'],
+          ['id', 'asc'],
+        ],
+      })
+    ).toBe(false)
+    expect(
+      isSuppressedNullBoundLimitVsStock('task', {
+        orderBy: dueAtAsc.orderBy,
+      })
+    ).toBe(false)
+    expect(isSuppressedNullBoundLimitVsStock('project', dueAtAsc)).toBe(false)
+  })
+
+  test('rejects a shape outside the declared generator grammar', () => {
+    const impossible: GenSpec = {
+      table: 'user',
+      orderBy: [['id', 'asc']],
+      exists: [{ rel: 'not-generated' }],
+    }
+    expect(() => sweepPairwiseCoverage([impossible])).toThrow(
+      'classifier produced unreachable axes'
+    )
+  })
+})

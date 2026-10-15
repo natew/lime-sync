@@ -1,0 +1,39 @@
+name = "orez-rust-sync-ingest-harness"
+main = "../lime-sync/test-workers/ingest-harness-worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["lime-sync-cf-host/wasm-module.wasm"]
+fallthrough = true
+
+[vars]
+ADMIN_KEY = "ingest-harness-admin"
+OREZ_DO_WRITE_BUDGET_ADMIN_TOKEN = "ingest-harness-do-admin"
+
+[[durable_objects.bindings]]
+name = "SYNC_DO"
+class_name = "SyncDurableObject"
+
+[[durable_objects.bindings]]
+name = "UPSTREAM_DO"
+class_name = "ZeroDO"
+
+[[durable_objects.bindings]]
+name = "ZERO_SQL_DO"
+class_name = "ZeroDO"
+
+[[services]]
+binding = "DATA"
+service = "orez-rust-sync-ingest-harness"
+entrypoint = "DataService"
+
+[[services]]
+binding = "APP"
+service = "orez-rust-sync-ingest-harness"
+entrypoint = "AppService"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncDurableObject", "ZeroDO"]
