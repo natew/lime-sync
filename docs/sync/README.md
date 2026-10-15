@@ -65,9 +65,9 @@ state is a last-mutation-id and the client-group to user binding.
 | `crates/sync-core`                           | The deterministic Rust sync engine.                                     |
 | `crates/sync-wasm`                           | The `wasm-bindgen` wrapper that compiles the engine for the DO host.    |
 | `crates/sync-native`                         | A standalone axum host for the same engine.                             |
-| `packages/lime-sync-cf-host`                      | The Cloudflare Durable Object host, published as `lime-sync-cf-host`.   |
-| `packages/lime-sync-browser-host`                 | The Bedrock and IndexedDB browser worker host, exported by `lime-sync`. |
-| `packages/lime-sync-executor`                     | Shared mutation transactions, CRUD, replay, and effect execution.       |
+| `packages/lime-sync-cf-host`                 | The Cloudflare Durable Object host, published as `lime-sync-cf-host`.   |
+| `packages/lime-sync-browser-host`            | The Bedrock and IndexedDB browser worker host, exported by `lime-sync`. |
+| `packages/lime-sync-executor`                | Shared mutation transactions, CRUD, replay, and effect execution.       |
 | `packages/lime-sync/src/client/transport.ts` | The stock Zero browser transport for Orez pull, push, and wake.         |
 | `packages/lime-sync/src/cf-do/worker.ts`     | The data worker that owns writes and serves the change feed.            |
 | `harness/`                                   | The conformance and qualification test harness.                         |
