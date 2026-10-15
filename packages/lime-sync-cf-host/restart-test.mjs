@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from './test-ports.ts'
 
 const adminKey = 'local-admin'
 const port = await findPort(0)

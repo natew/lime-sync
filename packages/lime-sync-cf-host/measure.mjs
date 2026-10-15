@@ -1,4 +1,4 @@
-import { findPort } from '../../src/port.ts'
+import { findPort } from './test-ports.ts'
 
 const percentile = (values, p) => {
   const sorted = [...values].sort((a, b) => a - b)

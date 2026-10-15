@@ -6,7 +6,7 @@
 // under query membership it must stay a few kilobytes and fast.
 import assert from 'node:assert/strict'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from './test-ports.ts'
 
 const adminKey = process.env.M3_ADMIN_KEY ?? 'local-admin'
 const port = await findPort(0)

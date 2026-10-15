@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from './test-ports.ts'
 
 const externalURL = process.env.M3_BASE_URL?.replace(/\/$/, '')
 const adminKey = process.env.M3_ADMIN_KEY ?? 'local-admin'

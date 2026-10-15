@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { findPort } from '../../src/port.ts'
+import { findPort } from './test-ports.ts'
 
 const port = await findPort(0)
 const server = Bun.spawn(
