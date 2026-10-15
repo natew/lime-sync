@@ -34,6 +34,7 @@
     "check:all": "bun run lint && bun run format:check && bun run check && bun run test",
     "release": "bun scripts/release.ts",
     "release:native:bootstrap": "bun scripts/bootstrap-sync-native-packages.ts",
+    "release:family:bootstrap": "bun scripts/bootstrap-sync-native-packages.ts family",
     "perf:cf-do": "bun run perf/scripts/bench-cf-do.ts",
     "perf:diagnose": "bun run perf/scripts/diagnose.ts"
   },

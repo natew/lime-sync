@@ -47,10 +47,11 @@ Configure all packages before `release.yml` reaches `main`. A package
 without the trusted publisher will reject its publish after earlier packages may
 already have been published.
 
-New native package names are bootstrapped from a clean, current `main` checkout
-after hosted CI passes:
+New package names are bootstrapped from a clean, current `main` checkout
+after hosted CI passes. Run the family first, then native:
 
 ```sh
+bun run release:family:bootstrap
 bun run release:native:bootstrap
 ```
 

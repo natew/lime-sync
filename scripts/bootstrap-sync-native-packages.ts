@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { relative, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 
@@ -33,10 +33,70 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2) + '\n')
 }
 
+function prepareFamilyBootstrapPackages(): string[] {
+  const packageDirs = [
+    'packages/lime-sync',
+    'packages/lime-sync-executor',
+    'packages/lime-sync-cf-host',
+    'sqlite-wasm',
+  ]
+  rmSync(bootstrapDir, { recursive: true, force: true })
+
+  return packageDirs.map((sourceDir) => {
+    const manifest = JSON.parse(
+      readFileSync(resolve(root, sourceDir, 'package.json'), 'utf8')
+    ) as Record<string, unknown>
+    const packageDir = resolve(bootstrapDir, sourceDir.replace('packages/', ''))
+    mkdirSync(packageDir, { recursive: true })
+    manifest.version = bootstrapVersion
+    manifest.description = `${String(manifest.description)} (package-name bootstrap only)`
+    delete manifest.bin
+    delete manifest.dependencies
+    delete manifest.devDependencies
+    delete manifest.exports
+    delete manifest.files
+    delete manifest.main
+    delete manifest.module
+    delete manifest.scripts
+    delete manifest.types
+    writeJson(resolve(packageDir, 'package.json'), manifest)
+    cpSync(resolve(root, 'LICENSE'), resolve(packageDir, 'LICENSE'))
+    return packageDir
+  })
+}
+
 function resolveTarget(): BootstrapTarget {
   const requested = process.argv[2] ?? 'native'
+  if (requested === 'family') {
+    return {
+      confirmation: 'CLAIM LIME-SYNC FAMILY PACKAGES',
+      errorLabel: 'family release files',
+      packageNames: [
+        'lime-sync',
+        'lime-sync-executor',
+        'lime-sync-cf-host',
+        'bedrock-sqlite',
+      ],
+      preparePackages: prepareFamilyBootstrapPackages,
+      relevantPaths: [
+        '.github/workflows/release.yml',
+        'scripts/bootstrap-sync-native-packages.ts',
+        'scripts/release.ts',
+        'scripts/verify-npm-release.ts',
+        'packages/lime-sync',
+        'packages/lime-sync-executor',
+        'packages/lime-sync-cf-host',
+        'sqlite-wasm',
+      ],
+      successMessage:
+        'All four lime-sync family package names and trusted publishers are ready.',
+      validateName: (name) => !name.startsWith('@'),
+      workflow: 'release.yml',
+      workspaceName: 'lime-sync-family-bootstrap-workspace',
+    }
+  }
   if (requested !== 'native') {
-    throw new Error('usage: bootstrap-sync-native-packages.ts [native]')
+    throw new Error('usage: bootstrap-sync-native-packages.ts [native|family]')
   }
 
   const packageNames = [
