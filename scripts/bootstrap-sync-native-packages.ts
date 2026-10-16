@@ -199,8 +199,7 @@ function trustMatches(config: TrustConfig, workflow: string): boolean {
     config.repository === 'natew/lime-sync' &&
     config.file === workflow &&
     config.environment === undefined &&
-    config.permissions?.length === 1 &&
-    config.permissions[0] === 'createPackage'
+    config.permissions?.slice().sort().join(',') === 'createPackage,createStagedPackage'
   )
 }
 
