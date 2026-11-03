@@ -1,0 +1,78 @@
+---
+title: Lime Sync architecture
+description: How the real Zero client connects to Lime Sync's SQLite-native server.
+---
+
+# Architecture
+
+Lime Sync implements Zero's server side with a deterministic Rust engine and
+SQLite storage. The browser runs the real `@rocicorp/zero` client unchanged.
+
+## Request and data flow
+
+```text
+                           query name + args
+                      ┌────────────────────────→ app query endpoint
+                      │                              │ authorized ZQL
+@rocicorp/zero client ── Zero protocol ──→ Lime Sync host ←──────┘
+   ▲                  │
+   │ row patches      │ mutation push
+   │                  └────────────────────────→ app mutate endpoint
+   │                                                 │ commit
+   │                                                 ▼
+   └──────────── query tracking ← change feed ← authoritative database
+```
+
+The two application endpoints are the same endpoints used with stock
+`zero-cache`. Lime Sync forwards the original authenticated request instead of
+reimplementing application logic.
+
+## Query path
+
+The client sends a registered query name and arguments. The application query
+endpoint authenticates the request and resolves that name to authorized ZQL.
+Lime Sync tracks the resulting row membership and sends an initial snapshot followed
+by incremental patches.
+
+The engine stores an internal query representation and reference counts.
+Application authors continue to use Zero's named queries and ZQL.
+
+## Mutation path
+
+The client runs its registered mutator optimistically, then Lime Sync forwards the
+mutation to the application push endpoint. The endpoint authenticates the
+request and executes the server-side mutator in the authoritative database.
+Committed rows return through the database change feed.
+
+This preserves one application mutation path and one write authority.
+
+## SQLite replica
+
+The Cloudflare host keeps a synchronized SQLite copy per namespace. Database
+changes enter the replica in commit order and append touched table/primary-key
+entries to the engine change log. Pull reads the current row in the same
+transaction, so intermediate values do not leak into client patches.
+
+## Cookies and retention
+
+Each namespace has a monotonic watermark and a retained floor:
+
+- cookie equals watermark: no changes;
+- cookie is inside retained history: incremental touched-key diff;
+- new or expired cookie: full snapshot;
+- cookie is ahead of the server: reset response.
+
+Pruning removes old change rows while preserving the durable high-water mark.
+
+## Mutation acknowledgements
+
+The engine tracks last-mutation IDs by client group and client. It records the
+application push result independently from row arrival through the change feed.
+This makes retries idempotent while keeping the application database as the only
+row authority.
+
+## Wake channel
+
+Wake is a data-available hint. The client follows it with a pull. Periodic safety
+pulls cover delayed, coalesced, duplicated, or missed wake frames; state and
+cookies always travel through pull responses.
