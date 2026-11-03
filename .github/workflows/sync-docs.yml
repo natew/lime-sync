@@ -1,0 +1,36 @@
+name: Sync documentation from Orez
+
+on:
+  schedule:
+    - cron: '13 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-docs
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: natew/orez
+          ref: main
+          path: orez-source
+          persist-credentials: false
+      - name: Update the documentation mirror
+        run: |
+          rsync -a --delete orez-source/site/data/lime-sync-docs/ docs/
+          git add -- docs
+          if git diff --cached --quiet -- docs; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'docs: sync from Orez'
+          git push

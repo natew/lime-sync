@@ -1,0 +1,74 @@
+---
+title: Lime Sync operations
+description: Namespace storage, health, observability, retention, recovery, and safe cutovers.
+---
+
+# Operations
+
+The application database remains the write authority. Lime Sync keeps a
+per-namespace replica plus the sync state needed to serve Zero clients. Operate
+the application endpoints, database change feed, and Lime Sync host as one path.
+
+## Health and status
+
+The Cloudflare host’s `/admin/status` reports its boot identity, connected wake
+sockets, durable database size, writer state, replication cursor, retained
+history floor, WASM memory size, and aggregate counters.
+
+Useful counters include pulls, forwarded pushes, query-endpoint failures,
+mutator failures, change-feed lag, resets, retention runs, invariant failures,
+and wake frames. Pair them with application endpoint traces and an end-to-end
+check that a committed row reaches another client.
+
+## Retention
+
+The deployment’s retained-history window bounds incremental changes. A client
+below the floor receives a snapshot and continues from the current watermark.
+Choose the window from expected offline duration, write rate, and snapshot cost.
+
+Pull work and memory scale with the rows selected by the client's desired
+queries.
+
+## Recovery paths
+
+| Condition                          | Safe behavior                                                  |
+| ---------------------------------- | -------------------------------------------------------------- |
+| Durable Object evicts              | Reopen SQLite and reconstruct in-memory state                  |
+| Client cookie is too old           | Send a full snapshot                                           |
+| Client cookie is ahead             | Reset it while preserving the durable watermark                |
+| Database feed cursor expires       | Resume or start a paged replica rebuild, then catch up changes |
+| Push response is lost after commit | Client retries safely using the mutation ID                    |
+| Wake is missed                     | Safety polling eventually triggers pull                        |
+
+An upstream resnapshot reads source tables in keyset pages and stages them as a
+new durable generation. A restart resumes from stored progress. After paging,
+Lime Sync replays concurrent changes, atomically swaps the staged tables into place,
+and bumps the engine epoch. Every client then performs one full resync. That
+reset is expected and ensures old cookies cannot address the new generation.
+
+## Writer controls and cutover
+
+The Cloudflare host persists a writer-enabled flag. An operator can stop push
+forwarding for a namespace, verify rejection, switch routing, and then enable
+the next sync host. The application database remains authoritative throughout.
+
+A safe cutover must prove:
+
+1. the current writer rejects new pushes,
+2. the next writer begins from an understood watermark or snapshot,
+3. client cookies are either compatible or intentionally reset,
+4. only one sync host can forward and acknowledge a new mutation, and
+5. rollback repeats the same fencing process.
+
+## Budgets and breakers
+
+Change-feed ingestion has a rolling billable-row budget and bounded retry
+backoff. Capacity planning also accounts for indexes, foreign keys, cascades,
+and sync metadata, which can turn one logical database change into several
+physical SQLite row writes.
+
+## Logs and sensitive data
+
+Structured engine events use hashed namespace identities and counts. Exclude
+tokens, auth claims beyond safe identifiers, mutation arguments, query results,
+and row patches. Application endpoint logs should preserve the same boundary.
